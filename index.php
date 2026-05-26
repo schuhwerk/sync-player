@@ -7,7 +7,7 @@
 // One deployment = one source. Pick + configure the adapter below.
 // See AGENTS.md for architecture. Source navigation uses // ## name comments
 // (no closing marker). The html-shell block uses #region/#endregion because
-// build.php splices it by name when producing dist/index.html.
+// build.php splices it by name when producing docs/index.html.
 
 // ## php-config — defaults → config.php → SYNCPLAYER_* env, request validation
 $audio_ext = ['mp3','m4a','aac','wav','ogg','oga','opus','flac','webm','weba'];

@@ -20,7 +20,7 @@
             }
         },
         {
-            "label": "build: dist/index.html",
+            "label": "build: docs/index.html",
             "type": "shell",
             "command": "php",
             "args": ["build.php"],
@@ -30,9 +30,9 @@
             "problemMatcher": []
         },
         {
-            "label": "build & open: dist/index.html",
-            "detail": "Builds dist/ and opens it through the preview server so demo/ works too.",
-            "dependsOn": ["build: dist/index.html", "preview: php -S localhost:8001 -t dist"],
+            "label": "build & open: docs/index.html",
+            "detail": "Builds docs/ and opens it through the preview server so demo/ works too.",
+            "dependsOn": ["build: docs/index.html", "preview: php -S localhost:8001 -t docs"],
             "dependsOrder": "sequence",
             "type": "shell",
             "command": "xdg-open http://localhost:8001/index.html || open http://localhost:8001/index.html",
@@ -41,11 +41,11 @@
             "problemMatcher": []
         },
         {
-            "label": "preview: php -S localhost:8001 -t dist",
-            "detail": "Serves dist/ exactly as GitHub Pages would — so demo/ URLs resolve.",
+            "label": "preview: php -S localhost:8001 -t docs",
+            "detail": "Serves docs/ exactly as GitHub Pages would — so demo/ URLs resolve.",
             "type": "shell",
             "command": "php",
-            "args": ["-S", "localhost:8001", "-t", "dist"],
+            "args": ["-S", "localhost:8001", "-t", "docs"],
             "options": { "cwd": "${workspaceFolder}" },
             "isBackground": true,
             "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },

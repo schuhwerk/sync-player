@@ -1,5 +1,5 @@
 public
 config.php
 .vscode/*.log
-# dist/ is tracked — it's the GitHub Pages artifact (index.html + demo/ songs).
-# `php build.php` rewrites dist/index.html, so expect that file to churn during dev.
+# docs/ is tracked — it's the GitHub Pages artifact (index.html + demo/ songs).
+# `php build.php` rewrites docs/index.html, so expect that file to churn during dev.

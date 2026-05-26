@@ -6,7 +6,7 @@
 (() => {
     let rootHandle = null;  // FileSystemDirectoryHandle (showDirectoryPicker)
     let rootEntry  = null;  // FileSystemEntry            (drag-drop fallback)
-    // Demo manifest (set by build.php when dist/demo/ has audio in it).
+    // Demo manifest (set by build.php when docs/demo/ has audio in it).
     // Flat list — subfolders are not supported in this mode; the goal is a
     // zero-click demo on GitHub Pages, not arbitrary remote browsing.
     let rootStatic = null;

@@ -1,6 +1,6 @@
 # Sync Player
 
-![Sync Player UI](dist/ui-screenshot.png)
+![Sync Player UI](docs/ui-screenshot.png)
 
 Web-Audio player that plays every audio file in a folder **at the same time, in sync** — for choir rehearsal stems, multi-mic recordings, alternate mixes, etc. Per-track + master volume, seekable waveforms, browser-side caching, and optional per-folder metadata (description + per-track base tones) stored in `.sync-player.json`.
 

@@ -8,29 +8,29 @@ filesystem**. One deployment = one source.
 Two deployment shapes from one source tree:
 
 1. **PHP server** (Nextcloud/local, YunoHost-friendly): `index.php` + `style.css` + `app.js`.
-2. **Single-file** (works from `file://`): `dist/index.html`, produced by
+2. **Single-file** (works from `file://`): `docs/index.html`, produced by
    `php build.php`. File System Access API, with drag-drop FileSystemEntry
    fallback for Firefox/Safari.
 
-No npm. PHP only on the server target; the dist is pure HTML.
+No npm. PHP only on the server target; the built artifact is pure HTML.
 
 ## Run
 
     php -S localhost:8000              # server target, open /?path=/
-    php build.php                      # → dist/index.html
-    php -S localhost:8001 -t dist      # preview dist as GH Pages would
+    php build.php                      # → docs/index.html
+    php -S localhost:8001 -t docs      # preview docs as GH Pages would
 
 Settings flow: defaults in `index.php` → `config.php` → `SYNCPLAYER_*` env
 (env wins — works with YunoHost's my_webapp_ynh admin panel without SSH).
 
 `build.php` is CLI-only (refuses HTTP via `PHP_SAPI !== 'cli'`). Inlines
 `style.css` + `app.js` + `adapters/browser-fs.js` + the html-shell region
-from `index.php` into `dist/index.html` by pure string concatenation.
+from `index.php` into `docs/index.html` by pure string concatenation.
 
 ### GitHub Pages demo
 
-`dist/` is tracked (not gitignored). Pages → "Branch: main, folder: /dist".
-If `dist/demo/` exists at build time with audio files, `build.php` embeds a
+`docs/` is tracked (not gitignored). Pages → "Branch: main, folder: /docs".
+If `docs/demo/` exists at build time with audio files, `build.php` embeds a
 static manifest at `CFG.demo = { baseUrl: 'demo/', files: [...] }`. The
 browser-fs adapter sees this, sets `rootStatic`, skips the picker. Drag-drop
 remains live: dropping a folder dispatches `sync-root-changed`, which
@@ -99,7 +99,7 @@ change for non-content reasons.
 
 ## Auth model
 
-Two independent server-side passwords (no effect on dist):
+Two independent server-side passwords (no effect on the built artifact):
 
 - **App password** (`app_password`) — gates `?mode=list|search|fetch`. Empty
   = no gate. Sent as `app_password=…`. 401 → `{error:'app_password_required',

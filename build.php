@@ -1,5 +1,5 @@
 <?php
-// Build the single-file dist/index.html (CLI only — refuses HTTP).
+// Build the single-file docs/index.html (CLI only — refuses HTTP).
 //
 // Strategy: inline style.css, pull the HTML body region out of index.php, then
 // swap the trailing <script> block (which is PHP-driven) for a static CFG that
@@ -32,7 +32,7 @@ $htmlRegion = trim($m[1]);
 // Strip the PHP-driven <script> at the end of html-shell — we replace it below.
 $htmlBody = preg_replace('/<script>window\.CFG.*$/s', '', $htmlRegion);
 
-// Pull audio extensions out of php-config so the dist agrees with the server.
+// Pull audio extensions out of php-config so the docs build agrees with the server.
 if (!preg_match('/\$audio_ext\s*=\s*\[(.*?)\];/s', $indexSrc, $m)) {
     fwrite(STDERR, "couldn't find \$audio_ext\n"); exit(1);
 }
@@ -40,11 +40,11 @@ $audio_ext = [];
 eval('$audio_ext = [' . $m[1] . '];');
 $audioExtJson = json_encode($audio_ext, JSON_UNESCAPED_SLASHES);
 
-// Scan dist/demo/ for audio files and previewable attachments. If any, embed a
-// static manifest into CFG.demo so the dist can open them from GitHub Pages
+// Scan docs/demo/ for audio files and previewable attachments. If any, embed a
+// static manifest into CFG.demo so the build can open them from GitHub Pages
 // without folder-picking.
 // Drag-drop still overrides (visitors can try their own folder after the demo).
-$demoDir = "$root/dist/demo";
+$demoDir = "$root/docs/demo";
 $demoCfg = 'null';
 $demoAudioCount = 0;
 $demoAttachmentCount = 0;
@@ -83,11 +83,11 @@ if (is_dir($demoDir)) {
     }
 }
 
-$distTitle = 'Sync Player';
+$docsTitle = 'Sync Player';
 $manifestIcon = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='22'%20fill='%23c8410a'/%3E%3Ctext%20x='50'%20y='72'%20font-size='62'%20text-anchor='middle'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E";
 $manifestJson = json_encode([
-    'name'             => $distTitle,
-    'short_name'       => $distTitle,
+    'name'             => $docsTitle,
+    'short_name'       => $docsTitle,
     'start_url'        => './',
     'scope'            => './',
     'display'          => 'standalone',
@@ -104,13 +104,13 @@ $out = <<<HTML
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>$distTitle</title>
+<title>$docsTitle</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Ctext%20y='.9em'%20font-size='90'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#c8410a">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="$distTitle">
+<meta name="apple-mobile-web-app-title" content="$docsTitle">
 <style>
 $cssContent
 </style>
@@ -139,16 +139,16 @@ $appJs
 </html>
 HTML;
 
-@mkdir("$root/dist");
-$dest = "$root/dist/index.html";
+@mkdir("$root/docs");
+$dest = "$root/docs/index.html";
 file_put_contents($dest, $out);
-file_put_contents("$root/dist/sw.js", $swJs);
-file_put_contents("$root/dist/manifest.webmanifest", $manifestJson);
+file_put_contents("$root/docs/sw.js", $swJs);
+file_put_contents("$root/docs/manifest.webmanifest", $manifestJson);
 
 printf("wrote %s (%s bytes)\n", $dest, number_format(strlen($out)));
 if ($demoAudioCount || $demoAttachmentCount) {
     printf(
-        "  + embedded demo manifest: %d audio file(s), %d attachment(s) in dist/demo/\n",
+        "  + embedded demo manifest: %d audio file(s), %d attachment(s) in docs/demo/\n",
         $demoAudioCount,
         $demoAttachmentCount,
     );
