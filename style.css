@@ -244,15 +244,16 @@ body.hide-wf .track .wf{display:none}
 /* Stage — spatial mix view. Hidden by default; revealed when body.stage-on. */
 .stage{display:none;margin:8px 0 24px}
 body.stage-on .stage{display:block}
-.stage-head{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}
-.stage-hint{flex:1;min-width:200px;color:var(--mut);font-size:12px;line-height:1.45}
+.stage-hint{display:block;margin-top:8px;color:var(--mut);font-size:12px;line-height:1.45;max-width:640px;margin-left:auto;margin-right:auto}
 .stage-reset{
+    position:absolute;top:10px;right:10px;z-index:1;
     min-width:auto;min-height:28px;padding:4px 12px;
     border:1px solid var(--brd);border-radius:var(--r-pill);
     font-family:var(--font-num);font-size:11px;
     text-transform:uppercase;letter-spacing:.08em;
 }
 .stage-canvas{
+    position:relative;
     width:100%;max-width:640px;aspect-ratio:1/1;margin:0 auto;
     border:1px solid var(--brd);border-radius:8px;
     background:color-mix(in oklab, var(--card) 92%, transparent);

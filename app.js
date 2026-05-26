@@ -1421,11 +1421,8 @@ function renderStage(files) {
         </g>`;
     }).join('');
     return `<div class="stage" id="stage" aria-label="Spatial mix">
-        <div class="stage-head">
-            <span class="stage-hint">Drag tracks and the listener. Volume rises as the listener moves closer; outside a track's ring is mute. Tap empty space to teleport the listener.</span>
-            <button type="button" class="btn stage-reset" id="stage-reset">Reset</button>
-        </div>
         <div class="stage-canvas">
+        <button type="button" class="btn stage-reset" id="stage-reset">Reset</button>
             <svg id="stage-svg" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
                 <g class="stage-tracks">${tracksSVG}</g>
                 <g class="stage-listener" id="stage-listener">
@@ -1434,6 +1431,7 @@ function renderStage(files) {
                 </g>
             </svg>
         </div>
+        <span class="stage-hint">Drag tracks and the listener. Volume rises as the listener moves closer; outside a track's ring is mute. Tap empty space to teleport the listener.</span>
     </div>`;
 }
 
