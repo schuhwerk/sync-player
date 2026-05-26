@@ -22,6 +22,16 @@ const MOBILE_PREDECODE_LIMIT = (() => {
     if (mem > 0) return 0;
     return 8 * 1024 * 1024;
 })();
+const VOLUME_SLIDER_MIN = 0;
+const VOLUME_SLIDER_MAX = 100;
+const DEFAULT_VOLUME = 0.5;
+const VOLUME_RAMP_SECONDS = 0.012;
+const gainToSliderValue = v => Math.max(VOLUME_SLIDER_MIN, Math.min(VOLUME_SLIDER_MAX, Math.round(v * VOLUME_SLIDER_MAX)));
+const sliderToGainValue = value => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return DEFAULT_VOLUME;
+    return Math.max(VOLUME_SLIDER_MIN, Math.min(VOLUME_SLIDER_MAX, n)) / VOLUME_SLIDER_MAX;
+};
 
 const _cloudUrlTemplate = CFG.cloudUrl || null;
 let _networkState = navigator.onLine ? 'online' : 'offline';
@@ -522,6 +532,7 @@ async function fetchTree() {
         if (Object.keys(tree).length) {
             mergeTreeEntries(tree, { stalePaths });
             await persistTree(_tree);
+            syncFolderFilterUI();
         }
         return _tree;
     })();
@@ -565,10 +576,7 @@ class SyncPlayer {
         this.peaks = [];
         this.gains = [];
         this.sources = [];
-        this.volumes = files.map(() => 1);
-        // Stage view's spatial attenuation per track, multiplied into the gain
-        // alongside volumes[i]. 1 when the stage is off — see js-stage.
-        this.stageAtten = files.map(() => 1);
+        this.volumes = files.map(() => DEFAULT_VOLUME);
         this.maxVolume = 1;
         this.duration = 0;
         this.isPlay = false;
@@ -588,6 +596,7 @@ class SyncPlayer {
         this._encoded = [];
         this._deferDecode = IS_MOBILE;
         this._decodePromise = null;
+        this._starting = false;
     }
 
     _startTickLoop() {
@@ -626,6 +635,31 @@ class SyncPlayer {
         return this.ctx;
     }
     _emit() { this.onChange?.(this); }
+    _normalizeVolume(v) {
+        return Number.isFinite(v) ? Math.max(0, Math.min(this.maxVolume, v)) : 0;
+    }
+    trackOutputVolume(i) {
+        return this._normalizeVolume(this.volumes[i]);
+    }
+    _trackGainTarget(i) {
+        return this.trackOutputVolume(i);
+    }
+    _applyTrackGain(i, immediate = false) {
+        const g = this.gains[i];
+        if (!g) return;
+        const target = this._trackGainTarget(i);
+        if (immediate || !this.ctx) {
+            g.gain.value = target;
+            return;
+        }
+        const now = this.ctx.currentTime;
+        if (typeof g.gain.cancelAndHoldAtTime === 'function') g.gain.cancelAndHoldAtTime(now);
+        else {
+            g.gain.cancelScheduledValues(now);
+            g.gain.setValueAtTime(g.gain.value, now);
+        }
+        g.gain.linearRampToValueAtTime(target, now + VOLUME_RAMP_SECONDS);
+    }
 
     async load() {
         const total = this.files.length;
@@ -782,7 +816,7 @@ class SyncPlayer {
                 g = this.gains[i] = this._ctx().createGain();
                 g.connect(this.limiter); // connect once — repeated connects stack and inflate gain
             }
-            g.gain.value = Math.min(this.maxVolume, this.volumes[i] * this.stageAtten[i]);
+            this._applyTrackGain(i, true);
             const src = this._ctx().createBufferSource();
             src.buffer = buf;
             src.connect(g);
@@ -796,6 +830,7 @@ class SyncPlayer {
         // press before the first resolved would otherwise double-fire _restartSources.
         if (this.isPlay || this._starting) return;
         this._starting = true;
+        this._emit();
         try {
             // First mobile play(): decode now. Resume the context first so iOS
             // honours the user gesture — decodeAudioData itself works on a
@@ -810,10 +845,14 @@ class SyncPlayer {
             this._restartSources();
             this.isPlay = true;
             this.lastTick = performance.now() / 1000;
+            this._starting = false;
             this._startTickLoop();
             this._emit();
         } finally {
-            this._starting = false;
+            if (this._starting) {
+                this._starting = false;
+                this._emit();
+            }
         }
     }
     pause() {
@@ -839,42 +878,50 @@ class SyncPlayer {
         if (this.isPlay) this._restartSources();
         this._emit();
     }
-    setVolume(i, v) {
-        const next = Number.isFinite(v) ? Math.max(0, Math.min(this.maxVolume, v)) : 0;
+    setVolume(i, v, { emit = true } = {}) {
+        const next = this._normalizeVolume(v);
+        if (this.volumes[i] === next) return;
         this.volumes[i] = next;
-        if (this.gains[i]) this.gains[i].gain.value = Math.min(this.maxVolume, next * this.stageAtten[i]);
-        this._emit();
+        this._applyTrackGain(i);
+        if (emit) this._emit();
     }
-    setStageAttenuation(i, v) {
-        this.stageAtten[i] = v;
-        if (this.gains[i]) this.gains[i].gain.value = Math.min(this.maxVolume, this.volumes[i] * v);
+    setVolumes(nextVolumes) {
+        let changed = false;
+        for (let i = 0; i < this.volumes.length; i++) {
+            const next = this._normalizeVolume(nextVolumes[i]);
+            if (this.volumes[i] === next) continue;
+            this.volumes[i] = next;
+            this._applyTrackGain(i);
+            changed = true;
+        }
+        if (changed) this._emit();
     }
-    setAllVolumes(v) { this.volumes.forEach((_, i) => this.setVolume(i, v)); }
+    setAllVolumes(v) { this.setVolumes(this.volumes.map(() => v)); }
     toggleMute() {
         this._preMuteAll ??= [];
         const allMuted = this.volumes.every(v => v === 0);
         if (allMuted) {
-            this.volumes.forEach((_, i) => this.setVolume(i, this._preMuteAll[i] ?? 1));
+            this.volumes.forEach((_, i) => this.setVolume(i, this._preMuteAll[i] ?? DEFAULT_VOLUME));
             return;
         }
         this._preMuteAll = [...this.volumes];
         this.setAllVolumes(0);
     }
     toggleTrackMute(i) {
-        // Stash the pre-mute volume so unmute can restore it. Default to 1 if track was already at 0.
+        // Stash the pre-mute volume so unmute can restore it. Default to 50% if track was already at 0.
         this._preMute ??= [];
         if (this.volumes[i] > 0) { this._preMute[i] = this.volumes[i]; this.setVolume(i, 0); }
-        else                    { this.setVolume(i, this._preMute[i] || 1); }
+        else                    { this.setVolume(i, this._preMute[i] || DEFAULT_VOLUME); }
     }
     soloTrack(i) {
         // If others are already silenced and this one alone is audible, restore everyone. Otherwise solo.
         this._preMute ??= [];
         const othersAllMuted = this.volumes.every((v, k) => k === i ? v > 0 : v === 0);
         if (othersAllMuted) {
-            this.volumes.forEach((_, k) => { if (k !== i) this.setVolume(k, this._preMute[k] || 0.5); });
+            this.volumes.forEach((_, k) => { if (k !== i) this.setVolume(k, this._preMute[k] || DEFAULT_VOLUME); });
         } else {
             this.volumes.forEach((v, k) => {
-                if (k === i) { if (v === 0) this.setVolume(k, this._preMute[k] || 0.5); }
+                if (k === i) { if (v === 0) this.setVolume(k, this._preMute[k] || DEFAULT_VOLUME); }
                 else { if (v > 0) this._preMute[k] = v; this.setVolume(k, 0); }
             });
         }
@@ -1541,9 +1588,11 @@ function syncOfflineUI() {
 // ## js-stage — spatial mix: tracks on a circle + draggable listener, distance sets volume
 // Each track sits in a normalized [0..1] square. Distance from track to listener
 // drives an equal-power falloff (cos curve). Past the per-track audibility radius
-// the track is fully muted. Stage attenuation multiplies into SyncPlayer's gain
-// next to the user's volume slider, so the slider keeps acting as a ceiling.
+// the track is fully muted. When the stage is active it writes those values
+// directly into the real per-track volumes; manual slider edits then deactivate it.
 const STAGE_ENABLED_KEY = 'syncplayer.stage.enabled';
+const STAGE_INFO_ACTIVE = 'Walk around the mix — drag tracks and the listener; distance sets each track\'s volume.';
+const STAGE_INFO_INACTIVE = 'Stage is visible but inactive — volume sliders now drive the mix directly. Drag the stage to reactivate it.';
 const STAGE_CIRCLE_R = 0.18;                        // default placement radius (square-normalized)
 // Audibility radius = 1.5 × placement radius. Anchors the falloff so:
 //   d = 0   (on the track)         → v = 1
@@ -1552,6 +1601,7 @@ const STAGE_CIRCLE_R = 0.18;                        // default placement radius 
 const STAGE_AUDIBLE_R = STAGE_CIRCLE_R * 1.5;
 
 let _stageOn = false;
+let _stageActive = true;
 let _stageState = null;          // {listener:{x,y}, tracks:{[name]:{x,y}}, fingerprint}
 let _stagePersistTimer = 0;
 
@@ -1615,28 +1665,77 @@ function stageTrackVolume(trackPos, listener) {
     return Math.cos(Math.PI / 2 * (d / STAGE_AUDIBLE_R));
 }
 
+function stageAffectsVolume() {
+    return _stageOn && _stageActive;
+}
+
+function setSliderVisual(slider, pct) {
+    if (!slider) return;
+    const n = Number(pct);
+    const clamped = Math.max(0, Math.min(100, Number.isFinite(n) ? n : 0));
+    slider.style.setProperty('--vol-pct', `${clamped}%`);
+}
+
+function syncStageUI() {
+    const inactive = _stageOn && !_stageActive;
+    document.body.classList.toggle('stage-on', _stageOn);
+    document.body.classList.toggle('stage-inactive', inactive);
+    const btn = $('menu-stage');
+    if (btn) {
+        btn.classList.toggle('on', _stageOn);
+        btn.setAttribute('aria-checked', String(_stageOn));
+        const lbl = btn.querySelector('.lbl');
+        if (lbl) lbl.textContent = inactive ? 'Stage (inactive)' : 'Stage';
+    }
+    const info = $('menu-stage-info');
+    if (info) info.textContent = inactive ? STAGE_INFO_INACTIVE : STAGE_INFO_ACTIVE;
+    const hint = $('stage-hint');
+    if (hint) hint.textContent = inactive ? STAGE_INFO_INACTIVE : 'Drag tracks and the listener. Volume rises as the listener moves closer; outside a track\'s ring is mute. Tap empty space to teleport the listener.';
+}
+
+function activateStageForGesture() {
+    if (_stageActive) return;
+    _stageActive = true;
+    syncStageUI();
+}
+
+function deactivateStageForManualVolume() {
+    if (!_stageOn || !_stageActive) return;
+    _stageActive = false;
+    syncStageUI();
+    applyStageAll();
+}
+
+function stageTrackLevel(i) {
+    if (!player || !_stageState) return DEFAULT_VOLUME;
+    const tp = _stageState.tracks[player.files[i].name];
+    return tp ? stageTrackVolume(tp, _stageState.listener) : DEFAULT_VOLUME;
+}
+
+function stageTrackVisualLevel(v) {
+    const gain = Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
+    return gain ** 1.5;
+}
+
+function syncStageTrackVisual(i) {
+    if (!player) return;
+    const g = document.querySelector(`.stage-track[data-i="${i}"]`);
+    if (!g) return;
+    const visual = stageAffectsVolume() ? stageTrackLevel(i) : (player.volumes[i] ?? 0);
+    g.style.setProperty('--stage-vol', stageTrackVisualLevel(visual).toFixed(3));
+}
+
 function applyStageTrack(i) {
     if (!player || !_stageState) return;
-    const tp = _stageState.tracks[player.files[i].name];
-    if (!tp) return;
-    const v = _stageOn ? stageTrackVolume(tp, _stageState.listener) : 1;
-    player.setStageAttenuation(i, v);
-    const g = document.querySelector(`.stage-track[data-i="${i}"]`);
-    if (g) g.style.setProperty('--stage-vol', v.toFixed(3));
-    // Mirror the effective volume on the slider at the top while dragging — the
-    // player doesn't emit on stage moves, so onPlayerChange wouldn't pick this up.
-    const tr = _trackEls[i];
-    if (!tr) return;
-    const eff = player.volumes[i] * v;
-    const pct = (eff * 100) | 0;
-    const slider = tr._tvol;
-    if (slider && document.activeElement !== slider) slider.value = pct;
-    if (tr._volNum) tr._volNum.textContent = pct;
-    tr.classList.toggle('muted', eff === 0);
+    if (stageAffectsVolume()) player.setVolume(i, stageTrackLevel(i));
+    else syncStageTrackVisual(i);
 }
 function applyStageAll() {
     if (!player) return;
-    for (let i = 0; i < player.files.length; i++) applyStageTrack(i);
+    if (stageAffectsVolume()) {
+        player.setVolumes(player.files.map((_, i) => stageTrackLevel(i)));
+    }
+    for (let i = 0; i < player.files.length; i++) syncStageTrackVisual(i);
 }
 
 function renderStage(files) {
@@ -1663,7 +1762,7 @@ function renderStage(files) {
                 </g>
             </svg>
         </div>
-        <span class="stage-hint">Drag tracks and the listener. Volume rises as the listener moves closer; outside a track's ring is mute. Tap empty space to teleport the listener.</span>
+        <span class="stage-hint" id="stage-hint">Drag tracks and the listener. Volume rises as the listener moves closer; outside a track's ring is mute. Tap empty space to teleport the listener.</span>
     </div>`;
 }
 
@@ -1719,6 +1818,7 @@ function bindStage(files) {
         const g = svg.querySelector(`.stage-track[data-i="${i}"]`);
         if (!g) return;
         bindStageDrag(g, (x, y) => {
+            activateStageForGesture();
             _stageState.tracks[f.name] = { x, y };
             setStageTrackPos(i, x, y);
             applyStageTrack(i);
@@ -1727,6 +1827,7 @@ function bindStage(files) {
     });
     const listener = $('stage-listener');
     if (listener) bindStageDrag(listener, (x, y) => {
+        activateStageForGesture();
         _stageState.listener = { x, y };
         setStageListenerPos(x, y);
         applyStageAll();
@@ -1739,6 +1840,7 @@ function bindStage(files) {
     svg.addEventListener('pointerdown', e => {
         if (e.target.closest('.stage-track') || e.target.closest('.stage-listener')) return;
         const rect = svg.getBoundingClientRect();
+        activateStageForGesture();
         _stageState.listener = {
             x: clamp01((e.clientX - rect.left) / rect.width),
             y: clamp01((e.clientY - rect.top) / rect.height),
@@ -1749,6 +1851,7 @@ function bindStage(files) {
     });
 
     $('stage-reset')?.addEventListener('click', () => {
+        activateStageForGesture();
         _stageState = stageDefaults(player.files);
         player.files.forEach((f, i) => {
             const p = _stageState.tracks[f.name];
@@ -1763,6 +1866,7 @@ function bindStage(files) {
 function initStage(files) {
     if (!files?.length) return;
     _stageState = loadStageStateFor(files);
+    syncStageUI();
     // Only bind when the SVG is actually in the DOM. When off, renderStage()
     // returns '' so there's nothing to bind to.
     if (_stageOn) bindStage(files);
@@ -1777,6 +1881,7 @@ function mountStage() {
     const playerEl = document.querySelector('.player');
     if (!playerEl) return false;
     playerEl.insertAdjacentHTML('beforeend', renderStage(player.files));
+    syncStageUI();
     if (!_stageState) _stageState = loadStageStateFor(player.files);
     bindStage(player.files);
     return true;
@@ -1789,13 +1894,9 @@ function unmountStage() {
 function applyStageEnabled(on) {
     const wasOn = _stageOn;
     _stageOn = !!on;
-    document.body.classList.toggle('stage-on', _stageOn);
+    if (_stageOn) _stageActive = true;
     try { localStorage.setItem(STAGE_ENABLED_KEY, _stageOn ? '1' : '0'); } catch (_) {}
-    const btn = $('menu-stage');
-    if (btn) {
-        btn.classList.toggle('on', _stageOn);
-        btn.setAttribute('aria-checked', String(_stageOn));
-    }
+    syncStageUI();
     if (_stageOn && !wasOn) mountStage();
     else if (!_stageOn && wasOn) unmountStage();
     applyStageAll();
@@ -1834,6 +1935,7 @@ function cachePlayerUI() {
         fwd5: $('fwd5'),
         time: $('time'),
         playIc: $('play-ic'),
+        startup: $('player-startup'),
         rep: $('rep'),
         mvol: $('mvol'),
         masterWrap: document.querySelector('.master-inner .vol-wrap'),
@@ -2475,11 +2577,7 @@ function applyFreshData(data) {
         }
         _folderState = nextFolders;
         inspect('fresh:patch-folders', { count: nextFolders.length, searching: !!inp?.value.trim() });
-        // Don't clobber an active search — fresh _folderState is already in
-        // place; clearing the query will reveal it.
-        if (ul && (!inp || !inp.value.trim())) {
-            ul.innerHTML = renderFolderItems(_folderState);
-        }
+        if (ul) syncFolderFilterUI();
         _lastRenderData = data;
         return;
     }
@@ -2694,10 +2792,7 @@ function renderFolderItems(folders) {
 function rerenderFolderBadges() {
     const ul = $('folders');
     if (!ul) return;
-    // Don't overwrite live search results — the filter will re-render on its own.
-    const inp = $('ffilter');
-    if (inp?.value.trim()) return;
-    ul.innerHTML = renderFolderItems(_folderState);
+    syncFolderFilterUI();
 }
 
 
@@ -2708,29 +2803,29 @@ function setFilterStatus(msg) {
     s.hidden = !msg;
 }
 
+function filterScope() {
+    return _tree
+        ? [...new Map(
+            Object.values(_tree).flatMap(e => e.folders || []).map(f => [f.path, f])
+          ).values()]
+        : _folderState;
+}
+
+function syncFolderFilterUI() {
+    const ul = $('folders');
+    if (!ul) return;
+    const q = $('ffilter')?.value.trim().toLowerCase() || '';
+    const found = q
+        ? filterScope().filter(f => f.name.toLowerCase().includes(q))
+        : _folderState;
+    ul.innerHTML = renderFolderItems(found);
+    setFilterStatus(q && !found.length ? 'No matches' : '');
+}
+
 function bindFilter() {
     const inp = $('ffilter');
     if (!inp) return;
-    inp.oninput = () => {
-        const q = inp.value.trim().toLowerCase();
-        const ul = $('folders');
-        if (!ul) return;
-        if (!q) {
-            ul.innerHTML = renderFolderItems(_folderState);
-            setFilterStatus('');
-            return;
-        }
-        // When the tree is available, search across all folders in the library;
-        // otherwise fall back to just the current level.
-        const scope = _tree
-            ? [...new Map(
-                Object.values(_tree).flatMap(e => e.folders || []).map(f => [f.path, f])
-              ).values()]
-            : _folderState;
-        const found = scope.filter(f => f.name.toLowerCase().includes(q));
-        ul.innerHTML = renderFolderItems(found);
-        setFilterStatus(found.length ? '' : 'No matches');
-    };
+    inp.oninput = syncFolderFilterUI;
     inp.focus({ preventScroll: true });
 }
 
@@ -2834,8 +2929,8 @@ function playerHTML(files, attachments = []) {
                 <div class="row">
                     <div class="nm" title="${escapeHtml(f.name)}">${escapeHtml(f.name.replace(/\.[^.]+$/, ''))}</div>
                     ${renderBaseToneControl(f.name)}
-                    <div class="vol-wrap">${spkr('Click: mute · Shift+Click: solo')}<input type="range" class="vol tvol" min="0" max="100" step="1" value="100" title="Track volume · Shift+Drag: set all others"></div>
-                    <span class="vol-num" aria-hidden="true">100</span>
+                    <div class="vol-wrap">${spkr('Click: mute · Shift+Click: solo')}<input type="range" class="vol tvol" min="${VOLUME_SLIDER_MIN}" max="${VOLUME_SLIDER_MAX}" step="1" value="${gainToSliderValue(DEFAULT_VOLUME)}" style="--vol-pct:${gainToSliderValue(DEFAULT_VOLUME)}%" title="Track volume · Shift+Drag: set all others"></div>
+                    <span class="vol-num" aria-hidden="true">${gainToSliderValue(DEFAULT_VOLUME)}</span>
                     ${trackMenuHTML(i)}
                 </div>
                 <div class="wf" title="Click to seek">
@@ -2854,8 +2949,9 @@ function playerHTML(files, attachments = []) {
             <button class="btn" id="rep" title="Repeat (r)"><svg class="icon" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg></button>
             <button type="button" class="btn bt-action" id="bt-cascade" hidden>cascade</button>
             <span class="t" id="time">0:00 / 0:00</span>
+            <span class="player-startup" id="player-startup" hidden aria-live="polite">Preparing audio…</span>
             <span class="player-tools-status" id="bt-status"></span>
-            <div class="vol-wrap master-vol">${spkr('Mute all')}<input type="range" class="vol" id="mvol" min="0" max="100" step="1" value="100" title="Master volume"><span class="vol-state" id="mvol-state" aria-hidden="true">mixed</span></div>
+            <div class="vol-wrap master-vol">${spkr('Mute all')}<input type="range" class="vol" id="mvol" min="${VOLUME_SLIDER_MIN}" max="${VOLUME_SLIDER_MAX}" step="1" value="${gainToSliderValue(DEFAULT_VOLUME)}" style="--vol-pct:${gainToSliderValue(DEFAULT_VOLUME)}%" title="Set all track volumes"><span class="vol-state" id="mvol-state" aria-hidden="true">avg</span></div>
         </div>
     </div>` : '';
     // .play-cols is display:contents by default — only becomes a flex row when
@@ -2868,10 +2964,12 @@ function onPlayerChange(p) {
     if (!ui.seek) return; // user navigated away
     surfacePlayerLoadStatus(p);
     const colors = getWaveformColors();
-    const allMuted = p.volumes.every(v => v === 0);
-    const allSameVolume = p.volumes.every(v => v === p.volumes[0]);
-    const averageVolume = p.volumes.reduce((sum, v) => sum + v, 0) / p.volumes.length;
-    const masterDisplayVolume = allSameVolume ? p.volumes[0] : averageVolume;
+    const starting = !!p._starting;
+    const displayVolumes = [...p.volumes];
+    const allMuted = displayVolumes.every(v => v === 0);
+    const allSameVolume = displayVolumes.every(v => v === displayVolumes[0]);
+    const averageVolume = displayVolumes.reduce((sum, v) => sum + v, 0) / displayVolumes.length;
+    const masterDisplayVolume = allSameVolume ? displayVolumes[0] : averageVolume;
     const averagePct = Math.round(averageVolume * 100);
     const masterPct = Math.round(masterDisplayVolume * 100);
     const loading = p.loadedFraction < 1;
@@ -2884,27 +2982,36 @@ function onPlayerChange(p) {
         ? (Math.min(1, p.currentTime / p.duration) * 100) + '%' : '0%';
     ui.seek.classList.toggle('done', !loading);
     ui.seek.classList.toggle('is-loading', loading);
-    const disabled = p.loadedFraction < 1;
-    ui.play.disabled = ui.back5.disabled = ui.fwd5.disabled = disabled;
+    ui.play.disabled = p.loadedFraction < 1;
+    ui.back5.disabled = ui.fwd5.disabled = p.loadedFraction < 1 || starting;
+    ui.play.classList.toggle('is-loading', starting);
+    ui.play.setAttribute('aria-busy', starting ? 'true' : 'false');
+    if (ui.startup) ui.startup.hidden = !starting;
     const timeText = `${fmt(p.currentTime)} / ${fmt(p.duration)}`;
     if (ui.time.textContent !== timeText) ui.time.textContent = timeText;
-    ui.playIc.innerHTML = p.isPlay
-        ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
-        : '<path d="M8 5v14l11-7z"/>';
+    ui.playIc.innerHTML = starting
+        ? '<circle cx="12" cy="12" r="7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="30 18" transform="rotate(-90 12 12)"/>'
+        : p.isPlay
+            ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
+            : '<path d="M8 5v14l11-7z"/>';
+    ui.playIc.classList.toggle('icon-spin', starting);
     ui.rep.classList.toggle('on', p.repeat);
     ui.masterWrap.classList.toggle('muted', allMuted);
     ui.masterWrap.classList.toggle('mixed', !allMuted && !allSameVolume);
     ui.mvol.title = allMuted
-        ? 'Master volume (all muted)'
+        ? 'Set all track volumes (all muted)'
         : allSameVolume
-            ? 'Master volume'
-            : `Mixed track volumes - average ${averagePct}% - drag to unify`;
+            ? 'Set all track volumes'
+            : `Set all track volumes - current average ${averagePct}% - drag to unify`;
     ui.mvol.setAttribute('aria-valuetext', allMuted
-        ? 'all muted'
+        ? 'all tracks muted'
         : allSameVolume
             ? `${masterPct} percent`
-            : `mixed track volumes, average ${averagePct} percent`);
-    if (document.activeElement !== ui.mvol) ui.mvol.value = masterPct;
+            : `track volumes vary, average ${averagePct} percent`);
+    setSliderVisual(ui.mvol, masterPct);
+    if (document.activeElement !== ui.mvol) ui.mvol.value = gainToSliderValue(masterDisplayVolume);
+    const mvolState = $('mvol-state');
+    if (mvolState) mvolState.textContent = !allMuted && !allSameVolume ? 'avg' : '';
 
     const played01 = p.duration ? p.currentTime / p.duration : 0;
     const fullRepaint = _wfFullRepaint;
@@ -2912,16 +3019,16 @@ function onPlayerChange(p) {
     const wfHidden = document.body.classList.contains('hide-wf');
     let needsRetry = false;
     _trackEls.forEach((tr, i) => {
-        // Effective = user-set ceiling × stage spatial attenuation. The slider
-        // reads the effective so the bars on top stay in sync as the listener
-        // moves around the stage. Stage off → stageAtten[i] is 1, so unchanged.
-        const eff = p.volumes[i] * (p.stageAtten?.[i] ?? 1);
-        const pct = (eff * 100) | 0;
-        const isMuted = eff === 0;
+        const raw = p.volumes[i] ?? 0;
+        const pct = Math.round(raw * 100);
+        const isMuted = raw === 0;
         tr.classList.toggle('muted', isMuted);
         const slider = tr._tvol;
-        if (slider && document.activeElement !== slider) slider.value = pct;
+        setSliderVisual(slider, pct);
+        if (slider && document.activeElement !== slider) slider.value = gainToSliderValue(raw);
         if (tr._volNum) tr._volNum.textContent = pct;
+        const stageTrack = document.querySelector(`.stage-track[data-i="${i}"]`);
+        if (stageTrack) stageTrack.style.setProperty('--stage-vol', stageTrackVisualLevel(raw).toFixed(3));
         if (wfHidden) return;
         const peaks = p.peaks[i];
         if (!peaks) return;
@@ -2956,7 +3063,8 @@ function bindControls() {
     });
     $('mvol').oninput = e => {
         const value = e.target.value;
-        player.setAllVolumes(value / 100);
+        deactivateStageForManualVolume();
+        player.setAllVolumes(sliderToGainValue(value));
         document.querySelectorAll('.tvol').forEach(slider => slider.value = value);
     };
     $('bt-cascade')?.addEventListener('click', runCascade);
@@ -2974,11 +3082,13 @@ function bindControls() {
             const sibSliders = [...document.querySelectorAll('.tvol')];
             const apply = cx => {
                 const t = Math.max(0, Math.min(1, (cx - rect.left) / rect.width));
-                const v = t * (tvol.max / 100); // track slider max=100 → v∈[0..1]
+                const raw = Number(tvol.min) + t * (Number(tvol.max) - Number(tvol.min));
+                const v = sliderToGainValue(raw);
+                deactivateStageForManualVolume();
                 // setVolume + force-sync visual: the activeElement guard in onPlayerChange
                 // skips whichever slider held focus before this shift-drag started.
                 player.volumes.forEach((_, k) => {
-                    if (k !== i) { player.setVolume(k, v); sibSliders[k].value = (v * 100) | 0; }
+                    if (k !== i) { player.setVolume(k, v); sibSliders[k].value = gainToSliderValue(v); }
                 });
             };
             apply(e.clientX);
@@ -2992,8 +3102,14 @@ function bindControls() {
             document.addEventListener('pointerup', onUp);
             document.addEventListener('pointercancel', onUp);
         });
-        tvol.oninput = e => player.setVolume(i, e.target.value / 100);
-        tr.querySelector('.vol-wrap .vol-ic').onclick = e => e.shiftKey ? player.soloTrack(i) : player.toggleTrackMute(i);
+        tvol.oninput = e => {
+            deactivateStageForManualVolume();
+            player.setVolume(i, sliderToGainValue(e.target.value));
+        };
+        tr.querySelector('.vol-wrap .vol-ic').onclick = e => {
+            deactivateStageForManualVolume();
+            e.shiftKey ? player.soloTrack(i) : player.toggleTrackMute(i);
+        };
         tr.querySelector('.bt-badge')?.addEventListener('click', () => playTrackTone(name));
         tr.querySelector('.bt-down')?.addEventListener('click', () => setTrackTone(name, shiftHalftone(toneForFile(name)?.freq ?? 440, -1), true));
         tr.querySelector('.bt-up')?.addEventListener('click', () => setTrackTone(name, shiftHalftone(toneForFile(name)?.freq ?? 440, 1), true));
@@ -3028,7 +3144,10 @@ function bindControls() {
             tr.querySelector('.bt-input')?.focus();
         });
     });
-    document.querySelector('.master-inner .vol-ic').onclick = () => player.toggleMute();
+    document.querySelector('.master-inner .vol-ic').onclick = () => {
+        deactivateStageForManualVolume();
+        player.toggleMute();
+    };
 
     document.body.onkeydown = e => {
         if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
@@ -3045,7 +3164,7 @@ function bindControls() {
         if (e.key === ' ' && e.target.tagName !== 'BUTTON') { player.toggle(); e.preventDefault(); }
         else if (e.key === 'ArrowLeft')  { player.seek(e.shiftKey ? -10 : -5); e.preventDefault(); }
         else if (e.key === 'ArrowRight') { player.seek(e.shiftKey ? 10 : 5);  e.preventDefault(); }
-        else if (e.key === 'm')          player.toggleMute();
+        else if (e.key === 'm')          { deactivateStageForManualVolume(); player.toggleMute(); }
         else if (e.key === 'r')          player.toggleRepeat();
     };
 

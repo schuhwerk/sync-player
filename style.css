@@ -299,6 +299,25 @@ body.has-player .inspect-log{bottom:calc(120px + env(safe-area-inset-bottom))}
     font-family:var(--font-num);text-transform:uppercase;letter-spacing:.08em;
     white-space:nowrap;
 }
+.player-startup{
+    display:inline-flex;align-items:center;gap:8px;
+    min-height:20px;padding:0 10px;
+    border-radius:var(--r-pill);
+    border:1px solid color-mix(in oklab, var(--acc) 30%, var(--brd));
+    background:color-mix(in oklab, var(--acc) 10%, var(--surf));
+    color:var(--acc);
+    font:600 11px/1 var(--font-num);
+    text-transform:uppercase;letter-spacing:.08em;
+    white-space:nowrap;
+}
+.player-startup::before{
+    content:'';
+    width:10px;height:10px;flex:none;
+    border-radius:50%;
+    border:2px solid color-mix(in oklab, var(--acc) 28%, transparent);
+    border-top-color:var(--acc);
+    animation:play-spin .8s linear infinite;
+}
 .player-tools-status.error{color:var(--acc)}
 .bt-action{
     min-width:auto;min-height:28px;padding:4px 10px;
@@ -365,10 +384,13 @@ body.stage-on .stage{display:block}
     touch-action:none;user-select:none;overflow:hidden;
 }
 .stage-canvas svg{width:100%;height:100%;display:block}
-.stage-track{cursor:grab}
+.stage-track{
+    cursor:grab;
+    opacity:calc(.5 + var(--stage-vol, 1) * .5);
+}
 .stage-track:active{cursor:grabbing}
 /* The audibility ring is the only per-track decoration — falloff inside is
-   implicit (dot opacity = current volume). Pointer-transparent so dragging
+   implicit (whole marker fades with current volume). Pointer-transparent so dragging
    through the ring grabs the track dot underneath. */
 /* Filled audibility disc — overlapping discs show "where >1 track is audible".
    Stroke kept very subtle for edge-definition without competing with the fills. */
@@ -378,10 +400,8 @@ body.stage-on .stage{display:block}
     stroke-width:.2;
     pointer-events:none;
 }
-/* Dot fades with current spatial volume — a faint visual readout of audibility. */
 .stage-track-dot{
     fill:var(--acc);
-    opacity:calc(.35 + var(--stage-vol, 1) * .65);
 }
 .stage-track-label{
     fill:var(--ink);
@@ -586,6 +606,17 @@ body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
         box-shadow:inset 0 0 0 1px var(--brd);
     }
     &:disabled:active{transform:none}
+    &.is-loading,
+    &.is-loading:disabled{
+        background:color-mix(in oklab, var(--acc) 88%, white);
+        color:var(--bg);
+        box-shadow:0 0 0 1px var(--acc-glow), 0 0 32px 0 var(--acc-glow);
+    }
+}
+.icon-spin{animation:play-spin .8s linear infinite}
+@keyframes play-spin{
+    from{transform:rotate(0)}
+    to{transform:rotate(360deg)}
 }
 
 /* volume groove */
@@ -625,22 +656,41 @@ body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
 .track.muted .vol-ic{fill:var(--mute)}
 .track.muted .vol{opacity:.38}
 
-/* sliders — overflow-hidden + giant thumb box-shadow paints the fill (chor-player trick).
-   Thumb shadow uses --acc so the fill picks up the amber glow naturally. */
+/* sliders — fill is driven by --vol-pct so stage mode can show spatial volume
+   without overwriting the underlying slider value / keyboard position. */
 input[type=range]{
     -webkit-appearance:none;appearance:none;
+    --vol-pct:50%;
     background:transparent;
     margin:0;width:100%;height:30px;
     overflow:hidden;border-radius:var(--r-pill);cursor:pointer;
 
     &:focus{outline:none}
+    &::-webkit-slider-runnable-track{
+        height:30px;
+        background:
+            linear-gradient(to right,
+                var(--acc) 0,
+                var(--acc) var(--vol-pct),
+                transparent var(--vol-pct),
+                transparent 100%);
+    }
     &::-webkit-slider-thumb{
         -webkit-appearance:none;width:0;height:30px;
-        box-shadow:-20rem 0 0 20rem var(--acc);
+        background:transparent;
+    }
+    &::-moz-range-track{
+        height:30px;border:0;
+        background:
+            linear-gradient(to right,
+                var(--acc) 0,
+                var(--acc) var(--vol-pct),
+                transparent var(--vol-pct),
+                transparent 100%);
     }
     &::-moz-range-thumb{
         width:0;height:30px;border:0;
-        box-shadow:-20rem 0 0 20rem var(--acc);
+        background:transparent;
     }
 }
 

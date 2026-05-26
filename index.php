@@ -53,8 +53,10 @@ $APP_PASSWORD      = $cfg['app_password'];
 $APP_PASSWORD_HINT = $cfg['app_password_hint'];
 $NEXTCLOUD         = $cfg['nextcloud'];
 $LOCAL             = $cfg['local'];
-$APP_ICON_SVG      = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><rect x='18' y='18' width='64' height='64' rx='18' fill='#c8410a'/><rect x='24' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/><path d='M43 35.6c0-2.3 2.5-3.8 4.5-2.6l19.8 11.4c2 1.2 2 4 0 5.2L47.5 61.1c-2 1.2-4.5-.3-4.5-2.6V35.6Z' fill='white'/><rect x='68' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/></svg>";
-$APP_ICON          = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG);
+$APP_ICON_SVG_DARK = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#ffb454' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#ece4d0'/></svg>";
+$APP_ICON_SVG_LIGHT = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#f3ecdc'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#c8410a' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#15110a'/></svg>";
+$APP_ICON_DARK     = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG_DARK);
+$APP_ICON_LIGHT    = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG_LIGHT);
 
 header("Content-Security-Policy: frame-ancestors 'self'");
 header('X-Robots-Tag: noindex, nofollow');
@@ -94,7 +96,7 @@ if (($_GET['mode'] ?? '') === 'manifest') {
         'background_color' => '#0e1116',
         'theme_color'      => '#c8410a',
         'icons' => [
-            ['src' => $APP_ICON, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
+            ['src' => $APP_ICON_DARK, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
         ],
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
@@ -818,7 +820,9 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title><?php echo htmlspecialchars($title); ?></title>
-<link rel="icon" href="<?php echo htmlspecialchars($APP_ICON, ENT_QUOTES); ?>">
+<link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_LIGHT, ENT_QUOTES); ?>" media="(prefers-color-scheme: light)">
+<link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_DARK, ENT_QUOTES); ?>" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_DARK, ENT_QUOTES); ?>">
 <link rel="manifest" href="?mode=manifest">
 <meta name="theme-color" content="#c8410a">
 <meta name="apple-mobile-web-app-capable" content="yes">

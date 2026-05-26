@@ -92,8 +92,10 @@ $version = max(
 );
 
 $docsTitle = 'Sync Player';
-$appIconSvg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><rect x='18' y='18' width='64' height='64' rx='18' fill='#c8410a'/><rect x='24' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/><path d='M43 35.6c0-2.3 2.5-3.8 4.5-2.6l19.8 11.4c2 1.2 2 4 0 5.2L47.5 61.1c-2 1.2-4.5-.3-4.5-2.6V35.6Z' fill='white'/><rect x='68' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/></svg>";
-$appIcon = 'data:image/svg+xml,' . rawurlencode($appIconSvg);
+$appIconDarkSvg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#ffb454' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#ece4d0'/></svg>";
+$appIconLightSvg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#f3ecdc'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#c8410a' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#15110a'/></svg>";
+$appIconDark = 'data:image/svg+xml,' . rawurlencode($appIconDarkSvg);
+$appIconLight = 'data:image/svg+xml,' . rawurlencode($appIconLightSvg);
 $manifestJson = json_encode([
     'name'             => $docsTitle,
     'short_name'       => $docsTitle,
@@ -103,7 +105,7 @@ $manifestJson = json_encode([
     'background_color' => '#0e1116',
     'theme_color'      => '#c8410a',
     'icons' => [
-        ['src' => $appIcon, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
+        ['src' => $appIconDark, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
     ],
 ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 
@@ -115,7 +117,9 @@ $out = <<<HTML
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>$docsTitle</title>
-<link rel="icon" href="$appIcon">
+<link rel="icon" href="$appIconLight" media="(prefers-color-scheme: light)">
+<link rel="icon" href="$appIconDark" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="$appIconDark">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#c8410a">
 <meta name="apple-mobile-web-app-capable" content="yes">
