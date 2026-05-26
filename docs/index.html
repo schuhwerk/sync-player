@@ -1,4 +1,4 @@
-<!-- Sync Player — built v1779828885 -->
+<!-- Sync Player — built v1779829198 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2163,6 +2163,8 @@ class SyncPlayer {
         this._decodePromise = null;
         this._starting = false;
         this._emitRafId = 0;
+        this._ctxHoldCount = 0;
+        this._ctxSuspendTimer = 0;
         this._destroyed = false;
     }
 
@@ -2177,6 +2179,43 @@ class SyncPlayer {
     }
     _stopTickLoop() {
         if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
+    }
+    _clearCtxSuspendTimer() {
+        if (!this._ctxSuspendTimer) return;
+        clearTimeout(this._ctxSuspendTimer);
+        this._ctxSuspendTimer = 0;
+    }
+    _resumeCtx() {
+        const ctx = this._ctx();
+        this._clearCtxSuspendTimer();
+        try { ctx.resume(); } catch(e) {}
+        return ctx;
+    }
+    _scheduleCtxSuspend() {
+        if (!this.ctx) return;
+        this._clearCtxSuspendTimer();
+        if (this.isPlay || this._ctxHoldCount > 0) return;
+        // Let the current event turn finish first so transient UI sounds can chain
+        // without fighting an immediate suspend/resume.
+        this._ctxSuspendTimer = setTimeout(() => {
+            this._ctxSuspendTimer = 0;
+            if (!this.ctx || this.isPlay || this._ctxHoldCount > 0 || this.ctx.state === 'closed') return;
+            try { this.ctx.suspend(); } catch(e) {}
+        }, 0);
+    }
+    holdContext() {
+        this._ctxHoldCount++;
+        const ctx = this._resumeCtx();
+        let released = false;
+        return {
+            ctx,
+            release: () => {
+                if (released) return;
+                released = true;
+                this._ctxHoldCount = Math.max(0, this._ctxHoldCount - 1);
+                this._scheduleCtxSuspend();
+            },
+        };
     }
 
     _ctx() {
@@ -2351,8 +2390,10 @@ class SyncPlayer {
 
     primePlayback() {
         if (this._destroyed || !this._deferDecode || this._decodePromise || this.isPlay) return;
-        try { this._ctx().resume(); } catch(e) {}
-        this._decodeAll();
+        const hold = this.holdContext();
+        this._decodeAll().finally(() => {
+            if (!this.isPlay) hold.release();
+        });
     }
 
     // Compute peaks for buffers we skipped (e.g. waveforms started hidden, user
@@ -2410,11 +2451,11 @@ class SyncPlayer {
             // suspended context, but the subsequent start() needs the gesture
             // chain unbroken.
             if (this._deferDecode) {
-                this._ctx().resume();
+                this._resumeCtx();
                 await this._decodeAll();
             }
             if (!this.buffers.some(Boolean)) return;
-            this._ctx().resume();
+            this._resumeCtx();
             this._restartSources();
             this.isPlay = true;
             this.lastTick = performance.now() / 1000;
@@ -2440,7 +2481,7 @@ class SyncPlayer {
         // Release the audio hardware so Bluetooth output reverts to other apps.
         // Browsers only drop the device when the context is suspended (or closed);
         // a running context with no sources still holds the sink open.
-        try { this.ctx?.suspend(); } catch(e) {}
+        this._scheduleCtxSuspend();
         this._emit();
     }
     toggle() { this.isPlay ? this.pause() : this.play(); }
@@ -2504,6 +2545,8 @@ class SyncPlayer {
         this._destroyed = true;
         this._stopTickLoop();
         if (this._emitRafId) { cancelAnimationFrame(this._emitRafId); this._emitRafId = 0; }
+        this._clearCtxSuspendTimer();
+        this._ctxHoldCount = 0;
         this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
         this.sources = [];
         this.isPlay = false;
@@ -2931,8 +2974,7 @@ function syncDescriptionUI() {
 
 function playTone(freq, durationMs = 720) {
     if (!player || !Number.isFinite(freq)) return () => {};
-    const ctx = player._ctx();
-    ctx.resume();
+    const { ctx, release } = player.holdContext();
     const mix = ctx.createGain();
     // Track #mvol: scale by the same average the master slider reflects, then a fixed boost so tones cut over the mix.
     const masterVol = player.volumes.length
@@ -2971,6 +3013,7 @@ function playTone(freq, durationMs = 720) {
         });
         mix.disconnect();
         filter.disconnect();
+        release();
     };
 
     filter.type = 'lowpass';
