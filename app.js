@@ -567,6 +567,20 @@ async function loadTree() {
 // ## js-player — SyncPlayer: one AudioContext, sample-accurate sync, soft limiter
 // Web Audio sync player — patterned after chor-player/web-api-player.ts but trimmed.
 // One AudioContext, one gain node per track, sources recreated on play/seek (BufferSourceNodes are one-shot).
+async function forEachConcurrent(items, limit, fn) {
+    if (!items.length) return;
+    const width = Math.max(1, Math.min(limit || items.length, items.length));
+    let next = 0;
+    const workers = Array.from({ length: width }, async () => {
+        for (;;) {
+            const i = next++;
+            if (i >= items.length) return;
+            await fn(items[i], i);
+        }
+    });
+    await Promise.all(workers);
+}
+
 class SyncPlayer {
     constructor(files, onChange) {
         this.files = files;
@@ -597,6 +611,8 @@ class SyncPlayer {
         this._deferDecode = IS_MOBILE;
         this._decodePromise = null;
         this._starting = false;
+        this._emitRafId = 0;
+        this._destroyed = false;
     }
 
     _startTickLoop() {
@@ -634,7 +650,14 @@ class SyncPlayer {
         }
         return this.ctx;
     }
-    _emit() { this.onChange?.(this); }
+    _emit() {
+        if (this._destroyed || this._emitRafId) return;
+        this._emitRafId = requestAnimationFrame(() => {
+            this._emitRafId = 0;
+            if (this._destroyed) return;
+            this.onChange?.(this);
+        });
+    }
     _normalizeVolume(v) {
         return Number.isFinite(v) ? Math.max(0, Math.min(this.maxVolume, v)) : 0;
     }
@@ -663,42 +686,26 @@ class SyncPlayer {
 
     async load() {
         const total = this.files.length;
-        let fetched = 0, decoded = 0;
+        let fetched = 0;
         this.loadError = '';
-        // Mobile tabs have hard memory caps (Safari is the strictest). Decoded
-        // PCM is ~10× the encoded size, so on mobile we hold encoded bytes
-        // only and defer decodeAudioData() until the user actually presses
-        // play (see _decodeAll, which runs decode sequentially). Fetch stays
-        // parallel everywhere — encoded bytes are small, and serialising fetch
-        // over a slow/throttled Nextcloud (N tracks × per-request delay) leaves
-        // the play button disabled for minutes.
+        // Mobile keeps only two encoded tracks in flight at once; desktop keeps
+        // the original parallel fetch behaviour and still decodes sequentially.
         const loadOne = async (f, i) => {
             try {
                 const key = `${f.path}::${f.lm}`;
                 const wfHidden = document.body.classList.contains('hide-wf');
                 const cached = wfHidden ? null : await cacheGet(key);
+                if (this._destroyed) return;
                 if (cached?.peaks) { this.peaks[i] = cached.peaks; this._emit(); }
                 const ak = audioKey(f);
                 let bytes = await audioCacheGet(ak);
                 if (!bytes) bytes = await loadBytes(f.path);
+                if (this._destroyed) return;
                 fetched++;
                 this.fetchedFraction = total ? fetched / total : 1;
-                if (this._deferDecode) {
-                    // Hang on to the encoded bytes; decode on first play. Bytes
-                    // are ~1/10 the size of decoded PCM, so peak memory stays low.
-                    this._encoded[i] = bytes;
-                    // Without a decoded buffer we don't know the file's duration
-                    // yet. Leave duration unset until decode runs.
-                } else {
-                    this.buffers[i] = await this._ctx().decodeAudioData(bytes);
-                    if (!wfHidden && !cached) {
-                        this.peaks[i] = computePeaks(this.buffers[i]);
-                        cachePut(key, { peaks: this.peaks[i] });
-                    }
-                    decoded++;
-                    this.loadedFraction = total ? decoded / total : 1;
-                }
+                this._encoded[i] = bytes;
             } catch (e) {
+                if (this._destroyed) return;
                 this.buffers[i] = null;
                 this._encoded[i] = null;
                 const m = e?.message || '';
@@ -708,47 +715,56 @@ class SyncPlayer {
                 inspect('audio:track-unavailable', { path: f.path, message: m || String(e) });
             }
             // Mobile gates play on bytes available; desktop on decoded buffers.
+            // On desktop we'll run _decodeAll immediately after Promise.all.
+            if (this._destroyed) return;
             if (this._deferDecode) this.loadedFraction = this.fetchedFraction;
             this._emit();
         };
-        await Promise.all(this.files.map(loadOne));
-        if (!this._deferDecode) {
-            const readyBuffers = this.buffers.filter(Boolean);
-            this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
-        }
-        // All load attempts are done. Clamp to 1 so the play button always
-        // enables, even when some files failed — loadError covers the feedback.
+        if (this._deferDecode) await forEachConcurrent(this.files, 2, loadOne);
+        else await Promise.all(this.files.map(loadOne));
+        if (this._destroyed) return;
         this.fetchedFraction = 1;
-        this.loadedFraction = 1;
+        if (!this._deferDecode) {
+            await this._decodeAll();
+            if (this._destroyed) return;
+            this.loadedFraction = 1;
+        }
         this._emit();
         this._maybePredecode();
     }
 
     _maybePredecode() {
-        if (!this._deferDecode || this._decodePromise || !MOBILE_PREDECODE_LIMIT) return;
+        if (this._destroyed || !this._deferDecode || this._decodePromise || !MOBILE_PREDECODE_LIMIT) return;
         const totalBytes = this._encoded.reduce((sum, bytes) => sum + (bytes?.byteLength || 0), 0);
         if (!totalBytes || totalBytes > MOBILE_PREDECODE_LIMIT) return;
         inspect('audio:mobile-predecode', { totalBytes, limit: MOBILE_PREDECODE_LIMIT, tracks: this.files.length });
         this._decodeAll();
     }
 
-    // Mobile-only: run decodeAudioData for every fetched track. Sequential to
-    // keep memory low — at any moment only one ArrayBuffer + its decoded buffer
+    // Run decodeAudioData for every fetched track. Sequential to keep peak
+    // memory low — at any moment only one ArrayBuffer + its decoded buffer
     // are live. Encoded bytes are nulled out as we go so they can be GC'd.
     async _decodeAll() {
+        if (this._destroyed) return;
         if (this._decodePromise) return this._decodePromise;
         this._decodePromise = (async () => {
             const wfHidden = document.body.classList.contains('hide-wf');
-            for (let i = 0; i < this.files.length; i++) {
+            const total = this.files.length;
+            let decoded = this.buffers.filter(Boolean).length;
+            for (let i = 0; i < total; i++) {
+                if (this._destroyed) return;
                 const bytes = this._encoded[i];
                 if (!bytes || this.buffers[i]) continue;
                 try {
-                    this.buffers[i] = await this._ctx().decodeAudioData(bytes);
-                    this._encoded[i] = null;
+                    const buf = await this._ctx().decodeAudioData(bytes);
+                    if (this._destroyed) return;
+                    this.buffers[i] = buf;
+                    this._encoded[i] = null; // release for GC
                     if (!wfHidden) {
                         const f = this.files[i];
                         const key = `${f.path}::${f.lm}`;
                         const cached = await cacheGet(key);
+                        if (this._destroyed) return;
                         if (!cached?.peaks) {
                             this.peaks[i] = computePeaks(this.buffers[i]);
                             cachePut(key, { peaks: this.peaks[i] });
@@ -757,27 +773,33 @@ class SyncPlayer {
                         }
                     }
                 } catch (e) {
+                    if (this._destroyed) return;
                     this.buffers[i] = null;
                     this._encoded[i] = null;
                     this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
                     inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
                 }
-                // loadedFraction stays at 1 (fetch was already done); decode
-                // happens after the play press, so we don't visually rewind
-                // the seek-bar fill. Emit so any duration consumer updates.
+                decoded++;
+                if (!this._deferDecode) this.loadedFraction = total ? decoded / total : 1;
                 this._emit();
             }
             const readyBuffers = this.buffers.filter(Boolean);
             this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
-            // After everything is decoded we're back to the normal lifecycle.
-            this._deferDecode = false;
+            if (this._deferDecode) {
+                this._deferDecode = false;
+                this.loadedFraction = 1;
+            }
             this._emit();
         })();
-        return this._decodePromise;
+        try {
+            return await this._decodePromise;
+        } finally {
+            this._decodePromise = null;
+        }
     }
 
     primePlayback() {
-        if (!this._deferDecode || this._decodePromise || this.isPlay) return;
+        if (this._destroyed || !this._deferDecode || this._decodePromise || this.isPlay) return;
         try { this._ctx().resume(); } catch(e) {}
         this._decodeAll();
     }
@@ -927,7 +949,20 @@ class SyncPlayer {
         }
     }
     toggleRepeat() { this.repeat = !this.repeat; this._emit(); }
-    destroy() { this._stopTickLoop(); this.pause(); try { this.ctx?.close(); } catch(e) {} }
+    destroy() {
+        this._destroyed = true;
+        this._stopTickLoop();
+        if (this._emitRafId) { cancelAnimationFrame(this._emitRafId); this._emitRafId = 0; }
+        this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
+        this.sources = [];
+        this.isPlay = false;
+        this.lastTick = 0;
+        this.onChange = null;
+        this._encoded = [];
+        this.buffers = [];
+        this.peaks = [];
+        try { this.ctx?.close(); } catch(e) {}
+    }
 }
 // ## js-waveform — precomputed peaks → DPR-aware canvas with played overlay
 const waveformLayerCache = new WeakMap();
@@ -2043,6 +2078,17 @@ document.addEventListener('click', e => {
 
 // Theme: 'auto' (default) follows OS, 'light' / 'dark' force. Persisted in localStorage.
 const THEME_KEY = 'syncplayer.theme';
+const PWA_THEME_COLORS = { light: '#f3ecdc', dark: '#0e1116' };
+const THEME_MEDIA_QUERY = '(prefers-color-scheme: dark)';
+function resolveTheme(theme) {
+    if (theme === 'light' || theme === 'dark') return theme;
+    try { return matchMedia(THEME_MEDIA_QUERY).matches ? 'dark' : 'light'; }
+    catch (_) { return 'dark'; }
+}
+function syncThemeColor(theme) {
+    const meta = document.getElementById('meta-theme-color');
+    if (meta) meta.setAttribute('content', PWA_THEME_COLORS[resolveTheme(theme)]);
+}
 function applyTheme(theme) {
     const t = ['auto','light','dark'].includes(theme) ? theme : 'auto';
     if (t === 'auto') document.documentElement.removeAttribute('data-theme');
@@ -2052,6 +2098,7 @@ function applyTheme(theme) {
         b.classList.toggle('on', b.dataset.theme === t);
         b.setAttribute('aria-checked', String(b.dataset.theme === t));
     });
+    syncThemeColor(t);
     invalidateWaveformPaint();
     if (player) onPlayerChange(player);
 }
@@ -2059,6 +2106,16 @@ function initTheme() {
     let t = 'auto';
     try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch(e) {}
     applyTheme(t);
+    try {
+        const mql = matchMedia(THEME_MEDIA_QUERY);
+        const onThemeMediaChange = () => {
+            let current = 'auto';
+            try { current = localStorage.getItem(THEME_KEY) || 'auto'; } catch(e) {}
+            if (current === 'auto') syncThemeColor('auto');
+        };
+        if (mql.addEventListener) mql.addEventListener('change', onThemeMediaChange);
+        else if (mql.addListener) mql.addListener(onThemeMediaChange);
+    } catch (_) {}
 }
 
 const SHOW_WF_KEY = 'syncplayer.showWaveforms';
@@ -3038,8 +3095,18 @@ function onPlayerChange(p) {
         }
         updateTrackProgress(tr, played01);
     });
-    if (needsRetry) requestAnimationFrame(() => { if (player) onPlayerChange(player); });
+
+    // Limit retries to prevent infinite loops if elements never get a width.
+    if (needsRetry) {
+        _onPlayerChangeRetries = (_onPlayerChangeRetries || 0) + 1;
+        if (_onPlayerChangeRetries < 10) {
+            requestAnimationFrame(() => { if (player) onPlayerChange(player); });
+        }
+    } else {
+        _onPlayerChangeRetries = 0;
+    }
 }
+let _onPlayerChangeRetries = 0;
 
 function bindControls() {
     // Blur after click so a follow-up Space press goes through the body keydown

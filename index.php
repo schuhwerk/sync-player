@@ -53,6 +53,8 @@ $APP_PASSWORD      = $cfg['app_password'];
 $APP_PASSWORD_HINT = $cfg['app_password_hint'];
 $NEXTCLOUD         = $cfg['nextcloud'];
 $LOCAL             = $cfg['local'];
+$PWA_THEME_COLOR_LIGHT = '#f3ecdc';
+$PWA_THEME_COLOR_DARK  = '#0e1116';
 $APP_ICON_SVG_DARK = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#ffb454' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#ece4d0'/></svg>";
 $APP_ICON_SVG_LIGHT = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#f3ecdc'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#c8410a' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#15110a'/></svg>";
 $APP_ICON_DARK     = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG_DARK);
@@ -105,8 +107,8 @@ if (($_GET['mode'] ?? '') === 'manifest') {
         'start_url'        => './',
         'scope'            => './',
         'display'          => 'standalone',
-        'background_color' => '#0e1116',
-        'theme_color'      => '#ffb454',
+        'background_color' => $PWA_THEME_COLOR_DARK,
+        'theme_color'      => $PWA_THEME_COLOR_DARK,
         'icons' => [
             ['src' => $APP_ICON_MANIFEST . '&size=192', 'sizes' => '192x192', 'type' => 'image/svg+xml', 'purpose' => 'any'],
             ['src' => $APP_ICON_MANIFEST . '&size=512', 'sizes' => '512x512', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
@@ -837,7 +839,9 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
 <link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_DARK, ENT_QUOTES); ?>" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_DARK, ENT_QUOTES); ?>">
 <link rel="manifest" href="?mode=manifest">
-<meta name="theme-color" content="#ffb454">
+<meta name="theme-color" content="<?php echo htmlspecialchars($PWA_THEME_COLOR_LIGHT, ENT_QUOTES); ?>" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="<?php echo htmlspecialchars($PWA_THEME_COLOR_DARK, ENT_QUOTES); ?>" media="(prefers-color-scheme: dark)">
+<meta id="meta-theme-color" name="theme-color" content="<?php echo htmlspecialchars($PWA_THEME_COLOR_DARK, ENT_QUOTES); ?>">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="<?php echo htmlspecialchars($TITLE); ?>">

@@ -92,6 +92,8 @@ $version = max(
 );
 
 $docsTitle = 'Sync Player';
+$pwaThemeColorLight = '#f3ecdc';
+$pwaThemeColorDark = '#0e1116';
 $appIconDarkSvg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#ffb454' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#ece4d0'/></svg>";
 $appIconLightSvg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#f3ecdc'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#c8410a' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#15110a'/></svg>";
 $appIconDark = 'data:image/svg+xml,' . rawurlencode($appIconDarkSvg);
@@ -104,8 +106,8 @@ $manifestJson = json_encode([
     'start_url'        => './',
     'scope'            => './',
     'display'          => 'standalone',
-    'background_color' => '#0e1116',
-    'theme_color'      => '#ffb454',
+    'background_color' => $pwaThemeColorDark,
+    'theme_color'      => $pwaThemeColorDark,
     'icons' => [
         ['src' => $manifestIconPath, 'sizes' => '192x192', 'type' => 'image/svg+xml', 'purpose' => 'any'],
         ['src' => $manifestIconPath, 'sizes' => '512x512', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
@@ -124,7 +126,9 @@ $out = <<<HTML
 <link rel="icon" href="$appIconDark" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="$appIconDark">
 <link rel="manifest" href="manifest.webmanifest">
-<meta name="theme-color" content="#ffb454">
+<meta name="theme-color" content="$pwaThemeColorLight" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="$pwaThemeColorDark" media="(prefers-color-scheme: dark)">
+<meta id="meta-theme-color" name="theme-color" content="$pwaThemeColorDark">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="$docsTitle">
