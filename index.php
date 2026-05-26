@@ -53,6 +53,8 @@ $APP_PASSWORD      = $cfg['app_password'];
 $APP_PASSWORD_HINT = $cfg['app_password_hint'];
 $NEXTCLOUD         = $cfg['nextcloud'];
 $LOCAL             = $cfg['local'];
+$APP_ICON_SVG      = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><rect x='18' y='18' width='64' height='64' rx='18' fill='#c8410a'/><rect x='24' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/><path d='M43 35.6c0-2.3 2.5-3.8 4.5-2.6l19.8 11.4c2 1.2 2 4 0 5.2L47.5 61.1c-2 1.2-4.5-.3-4.5-2.6V35.6Z' fill='white'/><rect x='68' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/></svg>";
+$APP_ICON          = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG);
 
 header("Content-Security-Policy: frame-ancestors 'self'");
 header('X-Robots-Tag: noindex, nofollow');
@@ -83,11 +85,6 @@ if ($APP_PASSWORD !== '' && !hash_equals($APP_PASSWORD, $appPwGiven)
 if (($_GET['mode'] ?? '') === 'manifest') {
     header('Content-Type: application/manifest+json');
     header('Cache-Control: no-cache');
-    // Same emoji glyph as the favicon, sized for install prompts. Chromium
-    // accepts `sizes:"any"` SVG as the install icon; iOS uses apple-touch-icon
-    // separately (see html head — currently the SVG too, which Safari ignores
-    // for the home-screen icon and falls back to a screenshot).
-    $svgIcon = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='22'%20fill='%23c8410a'/%3E%3Ctext%20x='50'%20y='72'%20font-size='62'%20text-anchor='middle'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E";
     echo json_encode([
         'name'             => $TITLE,
         'short_name'       => $TITLE,
@@ -97,7 +94,7 @@ if (($_GET['mode'] ?? '') === 'manifest') {
         'background_color' => '#0e1116',
         'theme_color'      => '#c8410a',
         'icons' => [
-            ['src' => $svgIcon, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
+            ['src' => $APP_ICON, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
         ],
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
@@ -153,18 +150,41 @@ class NextcloudAdapter extends Adapter {
     public function id(): string { return 'nc:' . $this->cfg['token']; }
     public function canWrite(): bool { return !empty($this->cfg['can_write']); }
     private function pwOr(string $given): string { return $given !== '' ? $given : $this->defaultPw; }
+    // Nextcloud's brute-force protection delays auth-touching responses by up to
+    // ~25s after a few failed attempts on the IP. Total timeout must outlast that
+    // or every list/fetch fails with curl 28 the moment the user mistypes once.
     private function curlBaseOptions(): array {
         return [
-            CURLOPT_CONNECTTIMEOUT => 4,
-            CURLOPT_TIMEOUT => 12,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_TIMEOUT => 30,
         ];
     }
-    private function curlFailure($ch, int $code): array {
+    // Returns ['header' => &string, 'callback' => callable] for capturing the
+    // X-Nextcloud-Bruteforce-Throttled header (presence = NC delayed this req).
+    private function throttleCapture(string &$slot): callable {
+        return function ($_c, $h) use (&$slot) {
+            if (stripos($h, 'x-nextcloud-bruteforce-throttled:') === 0) {
+                $slot = trim(substr($h, strlen('x-nextcloud-bruteforce-throttled:')));
+            }
+            return strlen($h);
+        };
+    }
+    private function curlFailure($ch, int $code, string $throttled = '', string $op = ''): array {
         $err = trim((string)curl_error($ch));
-        if ($code === 401) return ['_status' => 401, 'hint' => $this->pwHint];
-        if ($code < 200 || $code >= 400) {
-            return ['_status' => $code > 0 ? $code : 502, 'error' => $err !== '' ? $err : "Error: $code"];
+        $total = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
+        if ($code === 401) {
+            if ($throttled !== '' || $total > 5) error_log("syncplayer NC $op 401 throttled=$throttled time={$total}s");
+            return ['_status' => 401, 'hint' => $this->pwHint, 'throttled' => $throttled !== ''];
         }
+        if ($code < 200 || $code >= 400) {
+            error_log("syncplayer NC $op failed code=$code curl_err=\"$err\" throttled=$throttled time={$total}s");
+            return [
+                '_status' => $code > 0 ? $code : 502,
+                'error'   => $err !== '' ? $err : "Error: $code",
+                'throttled' => $throttled !== '',
+            ];
+        }
+        if ($total > 5) error_log("syncplayer NC $op slow code=$code throttled=$throttled time={$total}s");
         return [];
     }
     public function cloudUrl(string $path): ?string {
@@ -181,6 +201,7 @@ class NextcloudAdapter extends Adapter {
     public function list(string $path, string $password): array {
         if (!$this->cfg['token']) return ['_status' => 500, 'error' => 'Nextcloud token not configured'];
         $pw = $this->pwOr($password);
+        $throttled = '';
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $this->davUrl($path),
@@ -188,10 +209,11 @@ class NextcloudAdapter extends Adapter {
             CURLOPT_CUSTOMREQUEST => 'PROPFIND',
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => ['Depth: 1'],
+            CURLOPT_HEADERFUNCTION => $this->throttleCapture($throttled),
         ] + $this->curlBaseOptions());
         $xml = curl_exec($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        if ($fail = $this->curlFailure($ch, $code)) return $fail;
+        if ($fail = $this->curlFailure($ch, $code, $throttled, "list($path)")) return $fail;
 
         preg_match_all('#<d:response>(.*?)</d:response>#s', $xml, $rs);
         if (empty($rs[1])) return ['_status' => 502, 'error' => 'Invalid WebDAV response'];
@@ -219,6 +241,7 @@ class NextcloudAdapter extends Adapter {
     public function search(string $path, string $query, string $password): array {
         if (!$this->cfg['token']) return ['_status' => 500, 'error' => 'Nextcloud token not configured'];
         $pw = $this->pwOr($password);
+        $throttled = '';
         // PROPFIND Depth: infinity walks the full subtree in one round-trip. Some Nextcloud
         // instances disable this for public shares — they answer 403/405; we surface that.
         $ch = curl_init();
@@ -228,12 +251,13 @@ class NextcloudAdapter extends Adapter {
             CURLOPT_CUSTOMREQUEST => 'PROPFIND',
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER => ['Depth: infinity'],
+            CURLOPT_HEADERFUNCTION => $this->throttleCapture($throttled),
         ] + $this->curlBaseOptions());
         $xml = curl_exec($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        if ($code === 401) return ['_status' => 401, 'hint' => $this->pwHint];
+        if ($code === 401) return ['_status' => 401, 'hint' => $this->pwHint, 'throttled' => $throttled !== ''];
         if ($code === 403 || $code === 405) return ['_status' => $code, 'error' => 'Recursive search disabled on this share.'];
-        if ($fail = $this->curlFailure($ch, $code)) return $fail;
+        if ($fail = $this->curlFailure($ch, $code, $throttled, "search($path)")) return $fail;
 
         preg_match_all('#<d:response>(.*?)</d:response>#s', $xml, $rs);
         if (empty($rs[1])) return ['_status' => 502, 'error' => 'Invalid WebDAV response'];
@@ -267,22 +291,31 @@ class NextcloudAdapter extends Adapter {
         if ($download) attachmentHeader(basename($clean) ?: 'download');
 
         $final = 0;
+        $throttled = '';
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $req,
             CURLOPT_USERPWD => $this->cfg['token'] . ':' . $pw,
             CURLOPT_FOLLOWLOCATION => true,
+            // No hard CURLOPT_TIMEOUT here — large files over slow links may
+            // legitimately stream for minutes. CONNECTTIMEOUT still applies.
+            CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_HTTPHEADER => array_filter([
                 'Accept-Encoding: identity',
                 !empty($_SERVER['HTTP_RANGE']) ? 'Range: ' . $_SERVER['HTTP_RANGE'] : null,
                 !empty($_SERVER['HTTP_IF_NONE_MATCH']) ? 'If-None-Match: ' . $_SERVER['HTTP_IF_NONE_MATCH'] : null,
                 !empty($_SERVER['HTTP_IF_MODIFIED_SINCE']) ? 'If-Modified-Since: ' . $_SERVER['HTTP_IF_MODIFIED_SINCE'] : null,
             ]),
-            CURLOPT_HEADERFUNCTION => function ($_c, $h) use (&$final) {
+            CURLOPT_HEADERFUNCTION => function ($_c, $h) use (&$final, &$throttled) {
                 if (preg_match('#^HTTP/[\d.]+\s+(\d+)#', $h, $m)) {
                     $final = (int)$m[1];
                     if (($final >= 200 && $final < 400) || $final >= 400) http_response_code($final);
                     return strlen($h);
+                }
+                if (stripos($h, 'x-nextcloud-bruteforce-throttled:') === 0) {
+                    $throttled = trim(substr($h, strlen('x-nextcloud-bruteforce-throttled:')));
+                    // Forward to client so the SW/UI can react.
+                    header('X-Nextcloud-Bruteforce-Throttled: ' . $throttled);
                 }
                 if ((($final >= 200 && $final < 300) || $final === 304)
                     && preg_match('/^(Content-Type|Content-Length|Accept-Ranges|Content-Range|Last-Modified|ETag|Cache-Control):/i', $h)) {
@@ -293,6 +326,10 @@ class NextcloudAdapter extends Adapter {
             CURLOPT_WRITEFUNCTION => function ($_c, $d) { echo $d; return strlen($d); },
         ]);
         curl_exec($ch);
+        if ($final === 401 || $final === 0 || $final >= 500) {
+            $err = trim((string)curl_error($ch));
+            error_log("syncplayer NC fetch($path) final=$final curl_err=\"$err\" throttled=$throttled");
+        }
     }
     // davGet returns [httpCode, body, etag]. ETag is captured from response headers
     // and reused as the optimistic-lock token for the next write.
@@ -660,15 +697,22 @@ if (!$adapter) { http_response_code(500); exit('Unknown adapter: ' . htmlspecial
 // (e.g. {conflict: 'sidecar'}).
 function jsonExit(array $out, array $extra = []): void {
     header('Content-Type: application/json');
+    $throttled = !empty($out['throttled']);
+    if ($throttled) header('X-Nextcloud-Bruteforce-Throttled: 1');
     if (($out['_status'] ?? 0) === 401) {
         http_response_code(401);
-        echo json_encode(['error' => 'password_required', 'hint' => $out['hint'] ?? '']);
+        echo json_encode([
+            'error' => 'password_required',
+            'hint'  => $out['hint'] ?? '',
+            'throttled' => $throttled,
+        ]);
         exit;
     }
     if (isset($out['error'])) {
         http_response_code($out['_status'] ?? 500);
         $body = ['error' => $out['error']] + $extra;
         if (isset($out['conflict'])) $body['conflict'] = $out['conflict'];
+        if ($throttled) $body['throttled'] = true;
         echo json_encode($body);
         exit;
     }
@@ -774,7 +818,7 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title><?php echo htmlspecialchars($title); ?></title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Ctext%20y='.9em'%20font-size='90'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="<?php echo htmlspecialchars($APP_ICON, ENT_QUOTES); ?>">
 <link rel="manifest" href="?mode=manifest">
 <meta name="theme-color" content="#c8410a">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -820,7 +864,7 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
         <dt>Track speaker</dt><dd>Click to mute, <kbd>Shift</kbd>+click to solo</dd>
         <dt>Track volume</dt><dd><kbd>Shift</kbd>+drag to set all other tracks</dd>
     </dl>
-    <p class="hint">Issues: contact <a href="mailto:vitus.schuhwerk@mailbox.org">vitus.schuhwerk@mailbox.org</a> or open one at <a href="https://github.com/schuhwerk/sync-player" target="_blank" rel="noopener">github.com/schuhwerk/sync-player</a></p>
+    <p class="hint">Issues: contact <a href="mailto:vitus.schuhwerk@mailbox.org">vitus.schuhwerk@mailbox.org</a><br>or open one at <a href="https://github.com/schuhwerk/sync-player" target="_blank" rel="noopener">github.com/schuhwerk/sync-player</a></p>
 </div>
 <div id="menu" class="menu-pop" hidden role="menu" aria-label="More options">
     <button type="button" class="row on" id="menu-show-wf" role="menuitemcheckbox" aria-checked="true">
@@ -846,7 +890,7 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
         <span class="lbl">Inspection logging</span>
         <span class="switch" aria-hidden="true"></span>
     </button>
-    <p class="info" id="menu-inspect-info">Keeps a small in-memory trace. Inspect it in the console with <code>SyncInspect.dump()</code>.</p>
+    <p class="info" id="menu-inspect-info">Shows recent events in a floating panel (and keeps an in-memory ring buffer — <code>SyncInspect.dump()</code> in the console).</p>
     <hr>
     <a class="row" id="menu-cloud" href="#" target="_blank" rel="noopener" role="menuitem" hidden>
         <span class="lbl">Open externally</span>
@@ -860,6 +904,8 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
         <button type="button" data-theme="dark"  role="radio">Dark</button>
     </div>
 </div>
+<div id="status-banner" class="status-banner" data-level="info" hidden role="status" aria-live="polite"></div>
+<div id="inspect-log" class="inspect-log" hidden aria-hidden="true"></div>
 <div id="root"><div class="loading">Loading…</div></div>
 
 <script>window.CFG = {

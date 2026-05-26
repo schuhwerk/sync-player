@@ -27,6 +27,12 @@ Settings flow: defaults in `index.php` → `config.php` → `SYNCPLAYER_*` env
 `style.css` + `app.js` + `adapters/browser-fs.js` + the html-shell region
 from `index.php` into `docs/index.html` by pure string concatenation.
 
+**Never edit `docs/index.html`, `docs/sw.js`, or `docs/manifest.webmanifest`
+directly — they are build outputs.** Edit the sources (`index.php`,
+`style.css`, `app.js`, `adapters/browser-fs.js`, `sw.js`) and run
+`php build.php` to regenerate. The IDE may open `docs/index.html` for
+inspection; treat it as read-only.
+
 ### GitHub Pages demo
 
 `docs/` is tracked (not gitignored). Pages → "Branch: main, folder: /docs".

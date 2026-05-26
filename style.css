@@ -96,6 +96,52 @@ header{
     .net-ind .lbl{display:none}
 }
 
+.status-banner{
+    margin:8px var(--pd) 0;
+    padding:10px 14px;
+    border-radius:var(--r-md);
+    display:flex;align-items:center;gap:10px;
+    font-size:13px;line-height:1.4;
+    border:1px solid var(--brd);
+    background:var(--surf);
+    color:var(--ink);
+
+    & .status-msg{flex:1;min-width:0}
+    & .status-close{
+        flex:none;cursor:pointer;border:0;background:transparent;color:var(--mut);
+        font:600 18px/1 var(--font);padding:0 4px;border-radius:var(--r-sm);
+    }
+    & .status-close:hover{color:var(--ink);background:color-mix(in oklab, var(--ink) 8%, transparent)}
+
+    &[data-level="error"]{
+        border-color:color-mix(in oklab, #c8410a 50%, var(--brd));
+        background:color-mix(in oklab, #c8410a 8%, var(--surf));
+    }
+}
+
+.inspect-log{
+    position:fixed;
+    right:8px;bottom:calc(8px + env(safe-area-inset-bottom));
+    z-index:50;
+    width:min(360px, calc(100vw - 16px));
+    max-height:40vh;overflow:auto;
+    padding:8px 10px;
+    border-radius:var(--r-sm);
+    border:1px solid var(--brd);
+    background:color-mix(in oklab, var(--surf) 92%, transparent);
+    color:var(--ink);
+    font:11px/1.35 var(--font-num);
+    box-shadow:0 8px 24px rgba(0,0,0,.18);
+    pointer-events:auto;
+
+    & .inspect-row{display:flex;gap:6px;padding:1px 0;border-top:1px dashed var(--brd)}
+    & .inspect-row:first-child{border-top:0}
+    & .inspect-t{color:var(--mut);flex:none;width:7ch}
+    & .inspect-k{color:var(--acc);flex:none;min-width:9ch}
+    & .inspect-v{flex:1;min-width:0;word-break:break-all;white-space:pre-wrap}
+}
+body.has-player .inspect-log{bottom:calc(120px + env(safe-area-inset-bottom))}
+
 .btn{
     cursor:pointer;background:transparent;color:var(--ink);
     border:0;padding:8px;border-radius:var(--r-sm);
@@ -115,6 +161,40 @@ header{
 .icon{width:20px;height:20px;fill:currentColor}
 
 .folders-wrap{max-width:720px;margin:0 auto}
+#root{
+    position:relative;
+    min-height:0;
+}
+#root.nav-loading{
+    pointer-events:none;
+}
+#root.nav-loading > *{
+    opacity:.42;
+    transition:opacity .15s ease;
+}
+#root.nav-loading::before{
+    content:'';
+    position:absolute;
+    inset:0;
+    background:color-mix(in oklab, var(--bg) 72%, transparent);
+    z-index:1;
+}
+#root.nav-loading::after{
+    content:attr(data-nav-label);
+    position:absolute;
+    top:18px;left:50%;
+    transform:translateX(-50%);
+    z-index:2;
+    padding:9px 12px;
+    border:1px solid color-mix(in oklab, var(--acc) 24%, var(--brd));
+    border-radius:999px;
+    background:color-mix(in oklab, var(--surf) 92%, transparent);
+    color:var(--acc);
+    font:600 11px/1 var(--font-num);
+    letter-spacing:.1em;
+    text-transform:uppercase;
+    white-space:nowrap;
+}
 .filter{
     position:sticky;top:var(--hdr-h);z-index:30;
     background:var(--bg);
@@ -167,7 +247,12 @@ header{
 
         &:hover{background:color-mix(in oklab, var(--ink) 3%, transparent)}
         &:active{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+        &.is-pending{
+            background:color-mix(in oklab, var(--acc) 7%, transparent);
+            color:var(--acc);
+        }
         &:hover .chev{transform:translateX(3px);color:var(--acc)}
+        &.is-pending .chev{transform:translateX(3px);color:var(--acc)}
     }
     & .meta{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
     & .nm{
@@ -185,7 +270,25 @@ header{
     }
 }
 .no-match{padding:32px 6px;color:var(--mut);text-align:center;font-size:14px;list-style:none}
-.folder-pin-badge{display:inline-flex;align-items:center;flex:none;color:var(--acc);opacity:.7}
+.folder-pin-badge{
+    display:inline-flex;align-items:center;gap:6px;flex:none;
+    color:var(--acc);
+    border:1px solid color-mix(in oklab, var(--acc) 30%, var(--brd));
+    background:color-mix(in oklab, var(--acc) 10%, var(--surf));
+    border-radius:999px;
+    padding:5px 8px;
+    font:600 10px/1 var(--font-num);
+    letter-spacing:.08em;
+    text-transform:uppercase;
+
+    &.partial{
+        color:var(--mut);
+        border-color:color-mix(in oklab, var(--mut) 30%, var(--brd));
+        background:color-mix(in oklab, var(--mut) 9%, var(--surf));
+    }
+
+    & .lbl{white-space:nowrap}
+}
 
 .player{
     padding:16px var(--pd) 24px;max-width:880px;margin:0 auto;
@@ -358,6 +461,18 @@ body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
             pointer-events:none;
         }
         &.done > i{opacity:0;transition:opacity .25s ease .15s}
+        /* indeterminate sweep: fires when no fetch progress yet */
+        & > i.indeterminate{
+            width:100% !important;transition:none;
+            background:linear-gradient(to right,
+                transparent 0%,
+                color-mix(in oklab, var(--acc) 55%, transparent) 40%,
+                color-mix(in oklab, var(--acc) 55%, transparent) 60%,
+                transparent 100%);
+            background-size:30% 100%;background-repeat:no-repeat;
+            background-position:-30% 0;
+            animation:seek-indeterminate 1.4s ease-in-out infinite;
+        }
     }
     & .master-inner{
         max-width:880px;margin:0 auto;
@@ -398,6 +513,10 @@ body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
         }
         & .master-vol.mixed .vol-state{opacity:1}
     }
+}
+@keyframes seek-indeterminate{
+    from{background-position:-30% 0}
+    to  {background-position:130% 0}
 }
 
 @media (max-width: 720px) {
@@ -548,14 +667,25 @@ input[type=range]{
 .grp{
     margin-bottom:14px;
 
+    &.grp-shake{animation:auth-shake .36s ease-in-out}
+
     & input{
         width:100%;background:var(--bg);border:1px solid var(--brd);
         color:var(--ink);padding:12px 14px;border-radius:var(--r-md);
         font:inherit;outline:none;
         transition:border-color .15s,box-shadow .15s;
 
+        &[aria-invalid="true"]{border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft)}
+
         &:focus{border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft)}
     }
+}
+@keyframes auth-shake{
+    0%,100%{transform:translateX(0)}
+    20%{transform:translateX(-10px)}
+    40%{transform:translateX(9px)}
+    60%{transform:translateX(-7px)}
+    80%{transform:translateX(5px)}
 }
 .btn-p{
     background:var(--acc);color:var(--bg);

@@ -1,1 +1,1 @@
-Recording from Libby Montiel Gopal — check out their YouTube: https://www.youtube.com/@LibbyMontielGopal
+Recording from Libby Montiel Gopal - check their YouTube: https://www.youtube.com/@LibbyMontielGopal

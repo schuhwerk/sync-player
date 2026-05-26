@@ -59,8 +59,10 @@ self.addEventListener('fetch', event => {
         try {
             const response = await fetch(event.request);
             if (response.ok) {
-                if (key) await cache.put(key, response.clone());
-                if (event.request.mode === 'navigate') await cache.put(shellUrl(), response.clone());
+                // cache.put() can throw NetworkError for large streaming responses;
+                // catch it so a caching failure never kills the actual fetch.
+                if (key) try { await cache.put(key, response.clone()); } catch (_) {}
+                if (event.request.mode === 'navigate') try { await cache.put(shellUrl(), response.clone()); } catch (_) {}
                 return response;
             }
             // Upstream failure (e.g. PHP server is reachable but its curl to

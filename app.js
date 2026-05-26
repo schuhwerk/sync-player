@@ -7,6 +7,22 @@ CFG.canWrite = !!CFG.canWrite;
 try { CFG.pw    = sessionStorage.getItem('spw_' + CFG.adapterId) || ''; } catch(e) {}
 try { CFG.appPw = sessionStorage.getItem('apw_' + CFG.adapterId) || ''; } catch(e) {}
 
+// Touch-only devices get cheaper defaults: no waveforms, no stage, sequential decode.
+// hover:none + pointer:coarse identifies phones/tablets regardless of viewport size,
+// so a narrow desktop window keeps the full experience.
+const IS_MOBILE = (() => {
+    try { return matchMedia('(hover: none) and (pointer: coarse)').matches; }
+    catch (_) { return false; }
+})();
+const MOBILE_PREDECODE_LIMIT = (() => {
+    if (!IS_MOBILE) return 0;
+    const mem = Number(navigator.deviceMemory || 0);
+    if (mem >= 8) return 24 * 1024 * 1024;
+    if (mem >= 4) return 12 * 1024 * 1024;
+    if (mem > 0) return 0;
+    return 8 * 1024 * 1024;
+})();
+
 const _cloudUrlTemplate = CFG.cloudUrl || null;
 let _networkState = navigator.onLine ? 'online' : 'offline';
 const INSPECT_KEY = 'syncplayer.inspect';
@@ -49,18 +65,46 @@ function setNetworkState(state) {
 function inspect(type, detail) {
     if (!_inspectEnabled) return;
     const payload = typeof detail === 'function' ? detail() : (detail || {});
-    _inspectEvents.push({ at: new Date().toISOString(), type, path: CFG.path, ...payload });
+    const evt = { at: new Date().toISOString(), type, path: CFG.path, ...payload };
+    _inspectEvents.push(evt);
     if (_inspectEvents.length > INSPECT_MAX) {
         _inspectEvents.splice(0, _inspectEvents.length - INSPECT_MAX);
     }
+    renderInspectRow(evt);
+}
+
+// Floating bottom-right panel mirroring _inspectEvents — the only practical way
+// to see what's happening on a phone where DevTools is impractical. Only the
+// last ~30 rows are kept in the DOM; the full ring buffer stays in memory.
+const INSPECT_DOM_MAX = 30;
+function renderInspectRow(evt) {
+    const panel = $('inspect-log');
+    if (!panel || panel.hidden) return;
+    const t = (evt.at || '').slice(11, 19); // HH:MM:SS
+    const { at, type, path, ...rest } = evt;
+    const v = Object.keys(rest).length ? JSON.stringify(rest) : '';
+    const row = document.createElement('div');
+    row.className = 'inspect-row';
+    row.innerHTML = `<span class="inspect-t"></span><span class="inspect-k"></span><span class="inspect-v"></span>`;
+    row.children[0].textContent = t;
+    row.children[1].textContent = type;
+    row.children[2].textContent = v;
+    panel.prepend(row);
+    while (panel.children.length > INSPECT_DOM_MAX) panel.lastChild.remove();
 }
 
 function syncInspectUI() {
     const btn = $('menu-inspect');
     const info = $('menu-inspect-info');
+    const panel = $('inspect-log');
     const visible = hasInspectQuery();
     if (btn) btn.hidden = !visible;
     if (info) info.hidden = !visible;
+    if (panel) {
+        panel.hidden = !(visible && _inspectEnabled);
+        if (panel.hidden) panel.innerHTML = '';
+        else _inspectEvents.slice(-INSPECT_DOM_MAX).forEach(renderInspectRow);
+    }
     if (!btn || !visible) return;
     btn.classList.toggle('on', _inspectEnabled);
     btn.setAttribute('aria-checked', String(_inspectEnabled));
@@ -110,7 +154,7 @@ function qs(mode, path, extra) {
 async function parseAuth(r) {
     const body = await r.json().catch(() => ({}));
     const key = body.error === 'app_password_required' ? '_appAuth' : '_auth';
-    return { [key]: true, hint: body.hint || '' };
+    return { [key]: true, hint: body.hint || '', throttled: !!body.throttled };
 }
 
 function apiCacheKey(mode, path) {
@@ -199,14 +243,57 @@ function currentCloudUrl() {
     }
 }
 
+let _pendingNavPath = '';
+
+function pendingNavLabel(path) {
+    const segs = String(path || '/').split('/').filter(Boolean);
+    return segs.length ? `Opening ${segs[segs.length - 1]}…` : 'Opening folder…';
+}
+
+function syncPendingFolderLink() {
+    document.querySelectorAll('#folders a.is-pending').forEach(a => a.classList.remove('is-pending'));
+    if (!_pendingNavPath) return;
+    document.querySelectorAll('#folders a[data-path]').forEach(a => {
+        a.classList.toggle('is-pending', a.dataset.path === _pendingNavPath);
+    });
+}
+
+function setPendingNavigation(path) {
+    _pendingNavPath = path || '/';
+    const root = $('root');
+    if (root) {
+        root.classList.add('nav-loading');
+        root.dataset.navLabel = pendingNavLabel(_pendingNavPath);
+        root.setAttribute('aria-busy', 'true');
+    }
+    syncPendingFolderLink();
+    inspect('navigate:pending', { to: _pendingNavPath });
+}
+
+function clearPendingNavigation(path = null) {
+    if (path && _pendingNavPath && path !== _pendingNavPath) return;
+    _pendingNavPath = '';
+    const root = $('root');
+    if (root) {
+        root.classList.remove('nav-loading');
+        delete root.dataset.navLabel;
+        root.removeAttribute('aria-busy');
+    }
+    syncPendingFolderLink();
+}
+
 // Keep folder navigation in-app for both builds so cached data stays usable offline
 // and we don't depend on reloading the shell + app.js for each folder click.
 function navigate(newPath) {
+    newPath = newPath || '/';
+    if (newPath === CFG.path) return;
     inspect('navigate', { from: CFG.path, to: newPath });
     const params = searchParams();
     params.set('path', newPath);
     history.pushState(null, '', '?' + params.toString());
     CFG.path = newPath;
+    setHeader();
+    setPendingNavigation(newPath);
     init();
 }
 
@@ -221,7 +308,9 @@ window.addEventListener('offline', () => setNetworkState('offline'));
 // IndexedDB stores precomputed waveform peaks per file (Float32Array of length WF_PEAKS).
 // Key: `${path}::${lastModified}` — changing lm invalidates old peaks.
 // Encoded audio bytes use the browser HTTP cache (PHP forwards Cache-Control / Last-Modified).
-const WF_PEAKS = 1000;
+// 500 covers a ~500px-wide waveform at 1px/peak — anything denser is wasted on
+// every layout we ship. Halves the cached Float32Array per file.
+const WF_PEAKS = 500;
 const DB_NAME = 'syncplayer';
 const STORE = 'waveforms', LIST_STORE = 'listings', PINNED_STORE = 'pinned', AUDIO_STORE = 'audio';
 const TREE_STORAGE_KEY = `syncplayer.tree::${CFG.adapterId || 'default'}`;
@@ -246,32 +335,38 @@ const openDB = () => {
 };
 
 const storeGet = async (store, key) => {
-    const db = await openDB();
-    return new Promise(res => {
-        const r = db.transaction(store).objectStore(store).get(key);
-        r.onsuccess = () => res(r.result || null);
-        r.onerror = () => res(null);
-    });
+    try {
+        const db = await openDB();
+        return new Promise(res => {
+            const r = db.transaction(store).objectStore(store).get(key);
+            r.onsuccess = () => res(r.result || null);
+            r.onerror = () => res(null);
+        });
+    } catch (_) { return null; }
 };
 
 const storePut = async (store, key, val) => {
-    const db = await openDB();
-    return new Promise(res => {
-        const tx = db.transaction(store, 'readwrite');
-        tx.objectStore(store).put(val, key);
-        tx.oncomplete = () => res();
-        tx.onerror = () => res();
-    });
+    try {
+        const db = await openDB();
+        return new Promise(res => {
+            const tx = db.transaction(store, 'readwrite');
+            tx.objectStore(store).put(val, key);
+            tx.oncomplete = () => res();
+            tx.onerror = () => res();
+        });
+    } catch (_) {}
 };
 
 const storeDel = async (store, key) => {
-    const db = await openDB();
-    return new Promise(res => {
-        const tx = db.transaction(store, 'readwrite');
-        tx.objectStore(store).delete(key);
-        tx.oncomplete = () => res();
-        tx.onerror = () => res();
-    });
+    try {
+        const db = await openDB();
+        return new Promise(res => {
+            const tx = db.transaction(store, 'readwrite');
+            tx.objectStore(store).delete(key);
+            tx.oncomplete = () => res();
+            tx.onerror = () => res();
+        });
+    } catch (_) {}
 };
 
 const cacheGet      = key      => storeGet(STORE, key);
@@ -287,12 +382,14 @@ const audioCacheDel = key      => storeDel(AUDIO_STORE, key);
 const audioKey      = f        => `${f.path}::${f.lm || ''}`;
 
 const storeGetAllKeys = async (store) => {
-    const db = await openDB();
-    return new Promise(res => {
-        const r = db.transaction(store).objectStore(store).getAllKeys();
-        r.onsuccess = () => res(r.result || []);
-        r.onerror   = () => res([]);
-    });
+    try {
+        const db = await openDB();
+        return new Promise(res => {
+            const r = db.transaction(store).objectStore(store).getAllKeys();
+            r.onsuccess = () => res(r.result || []);
+            r.onerror   = () => res([]);
+        });
+    } catch (_) { return []; }
 };
 
 // Set of folder paths currently pinned — loaded before each render so badges
@@ -300,6 +397,15 @@ const storeGetAllKeys = async (store) => {
 let _pinnedPaths = new Set();
 async function loadPinnedPaths() {
     _pinnedPaths = new Set(await storeGetAllKeys(PINNED_STORE));
+}
+
+function folderOfflineState(path) {
+    if (_pinnedPaths.has(path)) return 'offline';
+    for (const pinnedPath of _pinnedPaths) {
+        if (pinnedPath === '/' || pinnedPath.startsWith(path + '/')) return 'contains';
+        if (path.startsWith(pinnedPath + '/')) return 'offline';
+    }
+    return '';
 }
 
 // Per segment, max(|sample|) → one Float32. WF_PEAKS segments total.
@@ -431,7 +537,7 @@ function refreshTreeInBackground() {
 }
 
 function scheduleTreeRefresh(delay = 180) {
-    if (window.SyncBackend || _treeRefreshPromise || _treeRefreshTimer) return;
+    if (IS_MOBILE || window.SyncBackend || _treeRefreshPromise || _treeRefreshTimer) return;
     _treeRefreshTimer = setTimeout(() => {
         _treeRefreshTimer = 0;
         refreshTreeInBackground();
@@ -463,15 +569,25 @@ class SyncPlayer {
         // Stage view's spatial attenuation per track, multiplied into the gain
         // alongside volumes[i]. 1 when the stage is off — see js-stage.
         this.stageAtten = files.map(() => 1);
-        this.maxVolume = 2;
+        this.maxVolume = 1;
         this.duration = 0;
         this.isPlay = false;
         this.lastTick = 0;
         this.currentTime = 0;
+        // On mobile we postpone decodeAudioData until the user actually presses
+        // play, but the play button still needs to enable after the bytes are
+        // available. fetchedFraction tracks fetch completion; loadedFraction
+        // tracks decode completion. Desktop keeps both moving in lockstep.
+        this.fetchedFraction = 0;
         this.loadedFraction = 0;
         this.loadError = '';
         this.repeat = true;
         this._rafId = 0;
+        // Encoded bytes, kept around on mobile until the first play() resolves
+        // them into AudioBuffers. Nulled after decode to release memory.
+        this._encoded = [];
+        this._deferDecode = IS_MOBILE;
+        this._decodePromise = null;
     }
 
     _startTickLoop() {
@@ -490,7 +606,7 @@ class SyncPlayer {
     _ctx() {
         if (!this.ctx) {
             this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-            // Soft limiter: stops sums of multiple tracks at >0 dBFS from clipping when master volume is pushed past 1.
+            // Soft limiter: stops multi-track sums from clipping at the output.
             const lim = this.ctx.createDynamicsCompressor();
             lim.threshold.value = -3; lim.knee.value = 0; lim.ratio.value = 20;
             lim.attack.value = 0.003; lim.release.value = 0.1;
@@ -513,39 +629,135 @@ class SyncPlayer {
 
     async load() {
         const total = this.files.length;
-        let loaded = 0;
+        let fetched = 0, decoded = 0;
         this.loadError = '';
-        await Promise.all(this.files.map(async (f, i) => {
+        // Mobile tabs have hard memory caps (Safari is the strictest). Decoded
+        // PCM is ~10× the encoded size, so on mobile we hold encoded bytes
+        // only and defer decodeAudioData() until the user actually presses
+        // play (see _decodeAll, which runs decode sequentially). Fetch stays
+        // parallel everywhere — encoded bytes are small, and serialising fetch
+        // over a slow/throttled Nextcloud (N tracks × per-request delay) leaves
+        // the play button disabled for minutes.
+        const loadOne = async (f, i) => {
             try {
                 const key = `${f.path}::${f.lm}`;
-                const cached = await cacheGet(key);
-                // Paint waveforms from IDB before audio decode finishes — the play
-                // button still gates on loadedFraction, but the page no longer looks
-                // like it's loading on a warm cache hit.
+                const wfHidden = document.body.classList.contains('hide-wf');
+                const cached = wfHidden ? null : await cacheGet(key);
                 if (cached?.peaks) { this.peaks[i] = cached.peaks; this._emit(); }
-                // Prefer IDB-cached bytes (only populated when the user pins the
-                // folder). Falling back to loadBytes goes through the SW or
-                // adapter; nothing is written back to IDB unless the folder is
-                // pinned (pinFolder handles writeback explicitly).
                 const ak = audioKey(f);
                 let bytes = await audioCacheGet(ak);
                 if (!bytes) bytes = await loadBytes(f.path);
-                this.buffers[i] = await this._ctx().decodeAudioData(bytes);
-                if (!cached) {
-                    this.peaks[i] = computePeaks(this.buffers[i]);
-                    cachePut(key, { peaks: this.peaks[i] });
+                fetched++;
+                this.fetchedFraction = total ? fetched / total : 1;
+                if (this._deferDecode) {
+                    // Hang on to the encoded bytes; decode on first play. Bytes
+                    // are ~1/10 the size of decoded PCM, so peak memory stays low.
+                    this._encoded[i] = bytes;
+                    // Without a decoded buffer we don't know the file's duration
+                    // yet. Leave duration unset until decode runs.
+                } else {
+                    this.buffers[i] = await this._ctx().decodeAudioData(bytes);
+                    if (!wfHidden && !cached) {
+                        this.peaks[i] = computePeaks(this.buffers[i]);
+                        cachePut(key, { peaks: this.peaks[i] });
+                    }
+                    decoded++;
+                    this.loadedFraction = total ? decoded / total : 1;
                 }
-                loaded++;
             } catch (e) {
                 this.buffers[i] = null;
-                this.loadError = this.loadError || 'Audio unavailable while the source is offline.';
-                inspect('audio:track-unavailable', { path: f.path, message: e?.message || String(e) });
+                this._encoded[i] = null;
+                const m = e?.message || '';
+                this.loadError = this.loadError || (/^HTTP /.test(m)
+                    ? `Audio unavailable (${m}).`
+                    : 'Audio unavailable — source is offline or unreachable.');
+                inspect('audio:track-unavailable', { path: f.path, message: m || String(e) });
             }
-            this.loadedFraction = total ? loaded / total : 1;
+            // Mobile gates play on bytes available; desktop on decoded buffers.
+            if (this._deferDecode) this.loadedFraction = this.fetchedFraction;
             this._emit();
-        }));
-        const readyBuffers = this.buffers.filter(Boolean);
-        this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
+        };
+        await Promise.all(this.files.map(loadOne));
+        if (!this._deferDecode) {
+            const readyBuffers = this.buffers.filter(Boolean);
+            this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
+        }
+        // All load attempts are done. Clamp to 1 so the play button always
+        // enables, even when some files failed — loadError covers the feedback.
+        this.fetchedFraction = 1;
+        this.loadedFraction = 1;
+        this._emit();
+        this._maybePredecode();
+    }
+
+    _maybePredecode() {
+        if (!this._deferDecode || this._decodePromise || !MOBILE_PREDECODE_LIMIT) return;
+        const totalBytes = this._encoded.reduce((sum, bytes) => sum + (bytes?.byteLength || 0), 0);
+        if (!totalBytes || totalBytes > MOBILE_PREDECODE_LIMIT) return;
+        inspect('audio:mobile-predecode', { totalBytes, limit: MOBILE_PREDECODE_LIMIT, tracks: this.files.length });
+        this._decodeAll();
+    }
+
+    // Mobile-only: run decodeAudioData for every fetched track. Sequential to
+    // keep memory low — at any moment only one ArrayBuffer + its decoded buffer
+    // are live. Encoded bytes are nulled out as we go so they can be GC'd.
+    async _decodeAll() {
+        if (this._decodePromise) return this._decodePromise;
+        this._decodePromise = (async () => {
+            const wfHidden = document.body.classList.contains('hide-wf');
+            for (let i = 0; i < this.files.length; i++) {
+                const bytes = this._encoded[i];
+                if (!bytes || this.buffers[i]) continue;
+                try {
+                    this.buffers[i] = await this._ctx().decodeAudioData(bytes);
+                    this._encoded[i] = null;
+                    if (!wfHidden) {
+                        const f = this.files[i];
+                        const key = `${f.path}::${f.lm}`;
+                        const cached = await cacheGet(key);
+                        if (!cached?.peaks) {
+                            this.peaks[i] = computePeaks(this.buffers[i]);
+                            cachePut(key, { peaks: this.peaks[i] });
+                        } else if (!this.peaks[i]) {
+                            this.peaks[i] = cached.peaks;
+                        }
+                    }
+                } catch (e) {
+                    this.buffers[i] = null;
+                    this._encoded[i] = null;
+                    this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
+                    inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
+                }
+                // loadedFraction stays at 1 (fetch was already done); decode
+                // happens after the play press, so we don't visually rewind
+                // the seek-bar fill. Emit so any duration consumer updates.
+                this._emit();
+            }
+            const readyBuffers = this.buffers.filter(Boolean);
+            this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
+            // After everything is decoded we're back to the normal lifecycle.
+            this._deferDecode = false;
+            this._emit();
+        })();
+        return this._decodePromise;
+    }
+
+    primePlayback() {
+        if (!this._deferDecode || this._decodePromise || this.isPlay) return;
+        try { this._ctx().resume(); } catch(e) {}
+        this._decodeAll();
+    }
+
+    // Compute peaks for buffers we skipped (e.g. waveforms started hidden, user
+    // toggled them on). Called from applyShowWaveforms. Cheap relative to decode.
+    computeMissingPeaks() {
+        for (let i = 0; i < this.buffers.length; i++) {
+            const buf = this.buffers[i];
+            if (!buf || this.peaks[i]) continue;
+            this.peaks[i] = computePeaks(buf);
+            const f = this.files[i];
+            cachePut(`${f.path}::${f.lm}`, { peaks: this.peaks[i] });
+        }
         this._emit();
     }
 
@@ -579,14 +791,30 @@ class SyncPlayer {
         }).filter(Boolean);
     }
 
-    play() {
-        if (!this.buffers.some(Boolean)) return;
-        this._ctx().resume();
-        this._restartSources();
-        this.isPlay = true;
-        this.lastTick = performance.now() / 1000;
-        this._startTickLoop();
-        this._emit();
+    async play() {
+        // Re-entrancy guard: on mobile play() awaits decode, so a second toggle
+        // press before the first resolved would otherwise double-fire _restartSources.
+        if (this.isPlay || this._starting) return;
+        this._starting = true;
+        try {
+            // First mobile play(): decode now. Resume the context first so iOS
+            // honours the user gesture — decodeAudioData itself works on a
+            // suspended context, but the subsequent start() needs the gesture
+            // chain unbroken.
+            if (this._deferDecode) {
+                this._ctx().resume();
+                await this._decodeAll();
+            }
+            if (!this.buffers.some(Boolean)) return;
+            this._ctx().resume();
+            this._restartSources();
+            this.isPlay = true;
+            this.lastTick = performance.now() / 1000;
+            this._startTickLoop();
+            this._emit();
+        } finally {
+            this._starting = false;
+        }
     }
     pause() {
         if (!this.isPlay) return;
@@ -612,8 +840,9 @@ class SyncPlayer {
         this._emit();
     }
     setVolume(i, v) {
-        this.volumes[i] = v;
-        if (this.gains[i]) this.gains[i].gain.value = Math.min(this.maxVolume, v * this.stageAtten[i]);
+        const next = Number.isFinite(v) ? Math.max(0, Math.min(this.maxVolume, v)) : 0;
+        this.volumes[i] = next;
+        if (this.gains[i]) this.gains[i].gain.value = Math.min(this.maxVolume, next * this.stageAtten[i]);
         this._emit();
     }
     setStageAttenuation(i, v) {
@@ -688,7 +917,7 @@ function invalidateWaveformPaint() {
 }
 document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
-        invalidateWaveformPaint();
+        if (!document.body.classList.contains('hide-wf')) invalidateWaveformPaint();
         if (player) onPlayerChange(player);
     }
 });
@@ -1411,7 +1640,10 @@ function applyStageAll() {
 }
 
 function renderStage(files) {
-    if (!files.length) return '';
+    // Stage is rendered lazily: while off, we skip the SVG entirely (no per-track
+    // <g>, no pointer-event bindings, no layout). applyStageEnabled injects it
+    // on demand when the user toggles the menu item on.
+    if (!files.length || !_stageOn) return '';
     const tracksSVG = files.map((f, i) => {
         const label = escapeHtml(f.name.replace(/\.[^.]+$/, '').slice(0, 14));
         return `<g class="stage-track" data-i="${i}">
@@ -1531,10 +1763,31 @@ function bindStage(files) {
 function initStage(files) {
     if (!files?.length) return;
     _stageState = loadStageStateFor(files);
-    bindStage(files);
+    // Only bind when the SVG is actually in the DOM. When off, renderStage()
+    // returns '' so there's nothing to bind to.
+    if (_stageOn) bindStage(files);
+}
+
+// Build + inject the stage SVG into the current player view (used when the
+// user toggles the stage on after a render where it was skipped). Returns
+// false if there's no player to inject into.
+function mountStage() {
+    if (!player || !player.files.length) return false;
+    if ($('stage')) return true;
+    const playerEl = document.querySelector('.player');
+    if (!playerEl) return false;
+    playerEl.insertAdjacentHTML('beforeend', renderStage(player.files));
+    if (!_stageState) _stageState = loadStageStateFor(player.files);
+    bindStage(player.files);
+    return true;
+}
+
+function unmountStage() {
+    $('stage')?.remove();
 }
 
 function applyStageEnabled(on) {
+    const wasOn = _stageOn;
     _stageOn = !!on;
     document.body.classList.toggle('stage-on', _stageOn);
     try { localStorage.setItem(STAGE_ENABLED_KEY, _stageOn ? '1' : '0'); } catch (_) {}
@@ -1543,12 +1796,15 @@ function applyStageEnabled(on) {
         btn.classList.toggle('on', _stageOn);
         btn.setAttribute('aria-checked', String(_stageOn));
     }
+    if (_stageOn && !wasOn) mountStage();
+    else if (!_stageOn && wasOn) unmountStage();
     applyStageAll();
 }
 
 function initStageEnabled() {
-    let v = '1';
-    try { v = localStorage.getItem(STAGE_ENABLED_KEY) ?? '1'; } catch (_) {}
+    const def = IS_MOBILE ? '0' : '1';
+    let v = def;
+    try { v = localStorage.getItem(STAGE_ENABLED_KEY) ?? def; } catch (_) {}
     applyStageEnabled(v === '1');
 }
 // ## js-ui — init/SWR, renderView, controls, attachments, keyboard
@@ -1584,6 +1840,17 @@ function cachePlayerUI() {
     };
 }
 function clearPlayerUICache() { _trackEls = []; _ui = {}; }
+
+// Stop an in-flight player so its loadBytes()/decode loops don't keep firing
+// against a backend we've decided is unauthed or unreachable.
+function teardownPlayer() {
+    if (!player) return;
+    try { player.destroy(); } catch (_) {}
+    player = null;
+    clearPlayerUICache();
+    disconnectWaveformObserver();
+    _lastLoadStatusKey = '';
+}
 
 function setHeader() {
     const segs = CFG.path.split('/').filter(Boolean);
@@ -1622,6 +1889,8 @@ window.addEventListener('popstate', () => {
     }
     initInspect();
     CFG.path = pathFromLocation();
+    setHeader();
+    setPendingNavigation(CFG.path);
     init();
 });
 // SPA wiring for folder navigation: keep internal `?path=` links in-app unless the
@@ -1701,12 +1970,15 @@ function applyShowWaveforms(show) {
     }
     if (show) {
         invalidateWaveformPaint();
-        if (player) onPlayerChange(player);
+        observeWaveformLayouts();
+        // Tracks loaded with wf hidden have empty peaks — compute them now.
+        if (player) { player.computeMissingPeaks?.(); onPlayerChange(player); }
     }
 }
 function initShowWaveforms() {
-    let v = '1';
-    try { v = localStorage.getItem(SHOW_WF_KEY) ?? '1'; } catch(e) {}
+    const def = IS_MOBILE ? '0' : '1';
+    let v = def;
+    try { v = localStorage.getItem(SHOW_WF_KEY) ?? def; } catch(e) {}
     applyShowWaveforms(v !== '0');
 }
 
@@ -2043,6 +2315,7 @@ const attachmentPreview = {
 async function init() {
     setHeader();
     if (window.SyncBackend && !window.SyncBackend.ready()) {
+        clearPendingNavigation(CFG.path);
         window.SyncBackend.renderPicker($('root'), () => init());
         return;
     }
@@ -2102,15 +2375,27 @@ async function init() {
     } catch (e) {
         setNetworkState('offline');
         inspect('init:list-error', { message: e?.message || String(e), renderedFromCache });
+        const msg = e?.message || String(e);
         if (renderedFromCache) {
+            setStatus('error', `Couldn’t reach the server (${msg}). Showing cached data.`);
             refreshPinState();
             return;
         }
-        renderError(e?.message || String(e));
+        renderError(msg);
         return;
     }
     if (!stillCurrent()) return;
-    if (handleAuth(data)) return;
+    if (handleAuth(data)) {
+        // SWR may have spun up a SyncPlayer that's now firing loadBytes against
+        // a 401 backend. Stop it before the auth screen takes over the DOM.
+        teardownPlayer();
+        return;
+    }
+    if (data.throttled) {
+        setStatus('info', 'Nextcloud is rate-limiting this IP. First requests will be slow for a bit.');
+    } else if (!data._stale && !data.error) {
+        clearStatus();
+    }
     setNetworkState(data._stale ? 'offline' : 'online');
     inspect('init:list-result', () => ({
         stale: !!data._stale,
@@ -2221,34 +2506,96 @@ function applyFreshData(data) {
     }
 }
 
-function renderError(msg) { $('root').innerHTML = `<div class="err">${escapeHtml(msg)}</div>`; }
+function renderError(msg) {
+    clearPendingNavigation(CFG.path);
+    $('root').innerHTML = `<div class="err">${escapeHtml(msg)}</div>`;
+    setStatus('error', msg);
+}
+
+// Reports per-track load failures in the status banner once load() has run.
+// Counted across all tracks so a partial failure ("2 of 8 unavailable") is
+// visible rather than buried in console. Successful (re)load clears the banner
+// if it was showing our own message.
+let _lastLoadStatusKey = '';
+function surfacePlayerLoadStatus(p) {
+    if (!p || p.loadedFraction < 1) return;
+    const failed = p.files.reduce((n, _, i) => n + (p._encoded[i] === null && !p.buffers[i] ? 1 : 0), 0);
+    const key = `${p.loadError}::${failed}`;
+    if (key === _lastLoadStatusKey) return;
+    _lastLoadStatusKey = key;
+    if (failed > 0) {
+        const total = p.files.length;
+        const detail = p.loadError ? ` — ${p.loadError}` : '';
+        setStatus('error', `${failed} of ${total} track${total === 1 ? '' : 's'} failed to load${detail}`);
+    }
+}
+
+// Top-of-page banner for failures and slow-path warnings. One slot — latest
+// call wins. Dismiss with the × or by calling clearStatus(). On mobile this is
+// the only feedback path (DevTools is impractical), so phrase messages so the
+// reader can act on them.
+function setStatus(level, msg) {
+    const el = $('status-banner');
+    if (!el) return;
+    el.dataset.level = level === 'error' ? 'error' : 'info';
+    el.innerHTML = `<span class="status-msg"></span><button type="button" class="status-close" aria-label="Dismiss">×</button>`;
+    el.querySelector('.status-msg').textContent = msg;
+    el.querySelector('.status-close').onclick = clearStatus;
+    el.hidden = false;
+    inspect('status', { level, msg });
+}
+function clearStatus() {
+    const el = $('status-banner');
+    if (!el) return;
+    el.hidden = true;
+    el.innerHTML = '';
+}
 
 // Auth-response dispatch helper. Returns true if `res` was a 401 (and renderAuth
 // was called), so the caller can early-return. Use it instead of the 2-liner.
 function handleAuth(res) {
-    if (res?._appAuth) { renderAuth({ app: true,  hint: res.hint }); return true; }
-    if (res?._auth)    { renderAuth({ app: false, hint: res.hint }); return true; }
+    if (res?._appAuth) {
+        const failed = _authFeedback === 'app';
+        _authFeedback = null;
+        renderAuth({ app: true, hint: res.hint, throttled: res.throttled, failed });
+        return true;
+    }
+    if (res?._auth) {
+        const failed = _authFeedback === 'share';
+        _authFeedback = null;
+        renderAuth({ app: false, hint: res.hint, throttled: res.throttled, failed });
+        return true;
+    }
+    _authFeedback = null;
     return false;
 }
 
-function renderAuth({ app, hint }) {
+let _authFeedback = null;
+
+function renderAuth({ app, hint, throttled, failed }) {
+    clearPendingNavigation(CFG.path);
     const title = app ? 'Access password' : 'Share password';
     const hintHtml = hint
         ? `<p style="margin:0 0 16px;color:var(--mut);font-size:13px;line-height:1.45">${escapeHtml(hint)}</p>`
         : '';
+    if (throttled) {
+        setStatus('info', 'Nextcloud is rate-limiting this IP after recent failed attempts — sign-in will be slow until it cools off.');
+    }
     $('root').innerHTML = `<div class="setup"><div class="box">
         <h3 style="margin-top:0">🔒 ${title}</h3>
         ${hintHtml}
         <form onsubmit="return submitPw(event, ${app ? 'true' : 'false'})">
-            <div class="grp"><input id="pwin" type="password" autofocus required></div>
+            <div class="grp${failed ? ' grp-shake' : ''}"><input id="pwin" type="password" autocomplete="current-password" autofocus required aria-invalid="${failed ? 'true' : 'false'}"></div>
             <button class="btn btn-p">Unlock</button>
         </form>
     </div></div>`;
+    $('pwin')?.focus();
 }
 
 window.submitPw = (e, isApp) => {
     e.preventDefault();
     const val = $('pwin').value;
+    _authFeedback = isApp ? 'app' : 'share';
     const key = isApp ? 'apw_' : 'spw_';
     if (isApp) CFG.appPw = val; else CFG.pw = val;
     try { sessionStorage.setItem(key + CFG.adapterId, val); } catch(e) {}
@@ -2262,12 +2609,13 @@ let _folderState = [];
 let _lastRenderData = null;
 
 function renderView(data) {
+    clearPendingNavigation(CFG.path);
     attachmentPreview.clear();
     _folderState = data.folders || [];
     const files = data.files || [];
     const attachments = data.attachments || [];
     inspect('render', { folders: _folderState.length, files: files.length, attachments: attachments.length });
-    const foldersBlock = _folderState.length ? `
+    const foldersBlock = _folderState.length && !files.length ? `
         <div class="folders-wrap">
             <div class="filter">
                 <div class="filter-box">
@@ -2319,6 +2667,7 @@ function disconnectWaveformObserver() {
 }
 function observeWaveformLayouts() {
     disconnectWaveformObserver();
+    if (document.body.classList.contains('hide-wf')) return;
     if (typeof ResizeObserver !== 'function') return;
     _wfObserver = new ResizeObserver(() => {
         if (!player) return;
@@ -2331,10 +2680,11 @@ function observeWaveformLayouts() {
 function renderFolderItems(folders) {
     if (!folders.length) return '<li class="no-match">No matches</li>';
     return folders.map(f => {
-        const pin = _pinnedPaths.has(f.path)
-            ? `<span class="folder-pin-badge" title="Available offline" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/></svg></span>`
+        const offlineState = folderOfflineState(f.path);
+        const pin = offlineState
+            ? `<span class="folder-pin-badge${offlineState === 'contains' ? ' partial' : ''}" title="${offlineState === 'contains' ? 'Contains offline content' : 'Available offline'}"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/></svg><span class="lbl">${offlineState === 'contains' ? 'Offline inside' : 'Offline'}</span></span>`
             : '';
-        return `<li><a href="${dirHref(f.path)}">
+        return `<li><a href="${dirHref(f.path)}" data-path="${escapeHtml(f.path)}">
             <div class="meta"><span class="nm">${escapeHtml(f.name)}</span></div>
             ${pin}<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
         </a></li>`;
@@ -2505,7 +2855,7 @@ function playerHTML(files, attachments = []) {
             <button type="button" class="btn bt-action" id="bt-cascade" hidden>cascade</button>
             <span class="t" id="time">0:00 / 0:00</span>
             <span class="player-tools-status" id="bt-status"></span>
-            <div class="vol-wrap master-vol">${spkr('Mute all')}<input type="range" class="vol" id="mvol" min="0" max="200" step="1" value="100" title="Master volume"><span class="vol-state" id="mvol-state" aria-hidden="true">mixed</span></div>
+            <div class="vol-wrap master-vol">${spkr('Mute all')}<input type="range" class="vol" id="mvol" min="0" max="100" step="1" value="100" title="Master volume"><span class="vol-state" id="mvol-state" aria-hidden="true">mixed</span></div>
         </div>
     </div>` : '';
     // .play-cols is display:contents by default — only becomes a flex row when
@@ -2516,6 +2866,7 @@ function playerHTML(files, attachments = []) {
 function onPlayerChange(p) {
     const ui = _ui;
     if (!ui.seek) return; // user navigated away
+    surfacePlayerLoadStatus(p);
     const colors = getWaveformColors();
     const allMuted = p.volumes.every(v => v === 0);
     const allSameVolume = p.volumes.every(v => v === p.volumes[0]);
@@ -2523,10 +2874,16 @@ function onPlayerChange(p) {
     const masterDisplayVolume = allSameVolume ? p.volumes[0] : averageVolume;
     const averagePct = Math.round(averageVolume * 100);
     const masterPct = Math.round(masterDisplayVolume * 100);
-    ui.loadFill.style.width = (p.loadedFraction * 100) + '%';
+    const loading = p.loadedFraction < 1;
+    const hasProgress = p.fetchedFraction > 0 || p.loadedFraction > 0;
+    // Show fetch progress as early visual signal while decode hasn't started yet
+    const fillFrac = p.loadedFraction > 0 ? p.loadedFraction : p.fetchedFraction;
+    ui.loadFill.style.width = (fillFrac * 100) + '%';
+    ui.loadFill.classList.toggle('indeterminate', loading && !hasProgress);
     ui.playFill.style.width = p.duration > 0
         ? (Math.min(1, p.currentTime / p.duration) * 100) + '%' : '0%';
-    ui.seek.classList.toggle('done', p.loadedFraction >= 1);
+    ui.seek.classList.toggle('done', !loading);
+    ui.seek.classList.toggle('is-loading', loading);
     const disabled = p.loadedFraction < 1;
     ui.play.disabled = ui.back5.disabled = ui.fwd5.disabled = disabled;
     const timeText = `${fmt(p.currentTime)} / ${fmt(p.duration)}`;
@@ -2581,6 +2938,10 @@ function bindControls() {
     // Blur after click so a follow-up Space press goes through the body keydown
     // handler (single toggle) rather than re-activating the still-focused button
     // (which would double-toggle with the body handler).
+    $('play').addEventListener('pointerdown', () => {
+        if (player.loadedFraction < 1) return;
+        player.primePlayback();
+    }, { passive: true });
     $('play').onclick = e => { player.toggle(); e.currentTarget.blur(); };
     $('back5').onclick = () => player.seek(-5);
     $('fwd5').onclick = () => player.seek(5);

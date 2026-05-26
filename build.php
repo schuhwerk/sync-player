@@ -83,8 +83,17 @@ if (is_dir($demoDir)) {
     }
 }
 
+// Version = max mtime of inlined sources — same sources → same version,
+// so unchanged rebuilds don't trigger spurious SW re-installs.
+$version = max(
+    filemtime("$root/app.js"),
+    filemtime("$root/style.css"),
+    filemtime("$root/adapters/browser-fs.js"),
+);
+
 $docsTitle = 'Sync Player';
-$manifestIcon = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Crect%20width='100'%20height='100'%20rx='22'%20fill='%23c8410a'/%3E%3Ctext%20x='50'%20y='72'%20font-size='62'%20text-anchor='middle'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E";
+$appIconSvg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#0e1116'/><rect x='18' y='18' width='64' height='64' rx='18' fill='#c8410a'/><rect x='24' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/><path d='M43 35.6c0-2.3 2.5-3.8 4.5-2.6l19.8 11.4c2 1.2 2 4 0 5.2L47.5 61.1c-2 1.2-4.5-.3-4.5-2.6V35.6Z' fill='white'/><rect x='68' y='32' width='8' height='36' rx='4' fill='white' opacity='.28'/></svg>";
+$appIcon = 'data:image/svg+xml,' . rawurlencode($appIconSvg);
 $manifestJson = json_encode([
     'name'             => $docsTitle,
     'short_name'       => $docsTitle,
@@ -94,18 +103,19 @@ $manifestJson = json_encode([
     'background_color' => '#0e1116',
     'theme_color'      => '#c8410a',
     'icons' => [
-        ['src' => $manifestIcon, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
+        ['src' => $appIcon, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
     ],
 ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 
 $out = <<<HTML
+<!-- Sync Player — built v$version -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>$docsTitle</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20100%20100'%3E%3Ctext%20y='.9em'%20font-size='90'%3E%F0%9F%8E%B5%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="$appIcon">
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#c8410a">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -142,7 +152,14 @@ HTML;
 @mkdir("$root/docs");
 $dest = "$root/docs/index.html";
 file_put_contents($dest, $out);
-file_put_contents("$root/docs/sw.js", $swJs);
+// Stamp CACHE_NAME with the build version so deploying a new build causes
+// the SW to re-install and evict the stale offline cache automatically.
+$swVersioned = str_replace(
+    'const CACHE_NAME = CACHE_PREFIX;',
+    "const CACHE_NAME = CACHE_PREFIX + '-v{$version}';",
+    $swJs
+);
+file_put_contents("$root/docs/sw.js", $swVersioned);
 file_put_contents("$root/docs/manifest.webmanifest", $manifestJson);
 
 printf("wrote %s (%s bytes)\n", $dest, number_format(strlen($out)));
