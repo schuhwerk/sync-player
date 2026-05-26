@@ -150,7 +150,9 @@ body.has-player .inspect-log{bottom:calc(120px + env(safe-area-inset-bottom))}
     transition:background .15s,transform .12s,opacity .15s,color .15s;
     min-width:40px;min-height:40px;
 
-    &:hover{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+    @media (hover:hover){
+        &:hover{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+    }
     &:active{background:color-mix(in oklab, var(--ink) 12%, transparent);transform:scale(.96)}
     &:disabled{opacity:.28;cursor:default}
     &:disabled:hover{background:transparent}

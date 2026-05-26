@@ -1,4 +1,4 @@
-<!-- Sync Player — built v1779827358 -->
+<!-- Sync Player — built v1779828103 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,7 +9,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%20100%20100%27%3E%3Crect%20width%3D%27100%27%20height%3D%27100%27%20rx%3D%2722%27%20fill%3D%27%230e1116%27%2F%3E%3Cpath%20d%3D%27M%2050%2022%20A%2028%2028%200%201%201%2022%2050%27%20fill%3D%27none%27%20stroke%3D%27%23ffb454%27%20stroke-width%3D%274%27%20stroke-linecap%3D%27round%27%2F%3E%3Cpath%20d%3D%27M46%2042%20L58%2050%20L46%2058%20Z%27%20fill%3D%27%23ece4d0%27%2F%3E%3C%2Fsvg%3E" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%20100%20100%27%3E%3Crect%20width%3D%27100%27%20height%3D%27100%27%20rx%3D%2722%27%20fill%3D%27%230e1116%27%2F%3E%3Cpath%20d%3D%27M%2050%2022%20A%2028%2028%200%201%201%2022%2050%27%20fill%3D%27none%27%20stroke%3D%27%23ffb454%27%20stroke-width%3D%274%27%20stroke-linecap%3D%27round%27%2F%3E%3Cpath%20d%3D%27M46%2042%20L58%2050%20L46%2058%20Z%27%20fill%3D%27%23ece4d0%27%2F%3E%3C%2Fsvg%3E">
 <link rel="manifest" href="manifest.webmanifest">
-<meta name="theme-color" content="#c8410a">
+<meta name="theme-color" content="#ffb454">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Sync Player">
@@ -166,7 +166,9 @@ body.has-player .inspect-log{bottom:calc(120px + env(safe-area-inset-bottom))}
     transition:background .15s,transform .12s,opacity .15s,color .15s;
     min-width:40px;min-height:40px;
 
-    &:hover{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+    @media (hover:hover){
+        &:hover{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+    }
     &:active{background:color-mix(in oklab, var(--ink) 12%, transparent);transform:scale(.96)}
     &:disabled{opacity:.28;cursor:default}
     &:disabled:hover{background:transparent}

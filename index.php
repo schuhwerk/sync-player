@@ -57,6 +57,7 @@ $APP_ICON_SVG_DARK = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 1
 $APP_ICON_SVG_LIGHT = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#f3ecdc'/><path d='M 50 22 A 28 28 0 1 1 22 50' fill='none' stroke='#c8410a' stroke-width='4' stroke-linecap='round'/><path d='M46 42 L58 50 L46 58 Z' fill='#15110a'/></svg>";
 $APP_ICON_DARK     = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG_DARK);
 $APP_ICON_LIGHT    = 'data:image/svg+xml,' . rawurlencode($APP_ICON_SVG_LIGHT);
+$APP_ICON_MANIFEST = '?mode=icon';
 
 header("Content-Security-Policy: frame-ancestors 'self'");
 header('X-Robots-Tag: noindex, nofollow');
@@ -74,7 +75,7 @@ $appPwGiven = (string)($_GET['app_password'] ?? $_POST['app_password'] ?? '');
 if (strlen($appPwGiven) > 256) { http_response_code(400); exit('Invalid app password'); }
 // The PWA manifest must be readable before the user has typed the app password
 // (the browser fetches it on every navigation), so it's allowed past this gate.
-$publicModes = ['manifest'];
+$publicModes = ['icon', 'manifest'];
 if ($APP_PASSWORD !== '' && !hash_equals($APP_PASSWORD, $appPwGiven)
     && isset($_GET['mode']) && !in_array($_GET['mode'], $publicModes, true)) {
     http_response_code(401);
@@ -83,20 +84,32 @@ if ($APP_PASSWORD !== '' && !hash_equals($APP_PASSWORD, $appPwGiven)
     exit;
 }
 
+// ## php-icon — installable PWAs need fetchable icon URLs, not just data: favicons
+if (($_GET['mode'] ?? '') === 'icon') {
+    $theme = (string)($_GET['theme'] ?? 'dark');
+    $svg = $theme === 'light' ? $APP_ICON_SVG_LIGHT : $APP_ICON_SVG_DARK;
+    header('Content-Type: image/svg+xml');
+    header('Cache-Control: public, max-age=3600');
+    echo $svg;
+    exit;
+}
+
 // ## php-manifest — PWA manifest, name = $TITLE so installs adopt the configured app name
 if (($_GET['mode'] ?? '') === 'manifest') {
     header('Content-Type: application/manifest+json');
     header('Cache-Control: no-cache');
     echo json_encode([
+        'id'               => './',
         'name'             => $TITLE,
         'short_name'       => $TITLE,
         'start_url'        => './',
         'scope'            => './',
         'display'          => 'standalone',
         'background_color' => '#0e1116',
-        'theme_color'      => '#c8410a',
+        'theme_color'      => '#ffb454',
         'icons' => [
-            ['src' => $APP_ICON_DARK, 'sizes' => 'any', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
+            ['src' => $APP_ICON_MANIFEST . '&size=192', 'sizes' => '192x192', 'type' => 'image/svg+xml', 'purpose' => 'any'],
+            ['src' => $APP_ICON_MANIFEST . '&size=512', 'sizes' => '512x512', 'type' => 'image/svg+xml', 'purpose' => 'any maskable'],
         ],
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
@@ -824,7 +837,7 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
 <link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_DARK, ENT_QUOTES); ?>" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="<?php echo htmlspecialchars($APP_ICON_DARK, ENT_QUOTES); ?>">
 <link rel="manifest" href="?mode=manifest">
-<meta name="theme-color" content="#c8410a">
+<meta name="theme-color" content="#ffb454">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="<?php echo htmlspecialchars($TITLE); ?>">
