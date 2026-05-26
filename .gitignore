@@ -1,5 +1,6 @@
 public
 config.php
-.vscode/*.log
+.vscode/*
+!.vscode/tasks.json
 # docs/ is tracked — it's the GitHub Pages artifact (index.html + demo/ songs).
 # `php build.php` rewrites docs/index.html, so expect that file to churn during dev.
