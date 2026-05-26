@@ -1,0 +1,63 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "serve: php -S localhost:8000",
+            "type": "shell",
+            "command": "php",
+            "args": ["-S", "localhost:8000"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "isBackground": true,
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "problemMatcher": {
+                "owner": "php",
+                "pattern": { "regexp": "^.*$", "file": 1, "location": 2, "message": 3 },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": ".*PHP .* Development Server .* started.*",
+                    "endsPattern": ".*Development Server .* started.*"
+                }
+            }
+        },
+        {
+            "label": "build: dist/index.html",
+            "type": "shell",
+            "command": "php",
+            "args": ["build.php"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": []
+        },
+        {
+            "label": "build & open: dist/index.html",
+            "detail": "Builds dist/ and opens it through the preview server so demo/ works too.",
+            "dependsOn": ["build: dist/index.html", "preview: php -S localhost:8001 -t dist"],
+            "dependsOrder": "sequence",
+            "type": "shell",
+            "command": "xdg-open http://localhost:8001/index.html || open http://localhost:8001/index.html",
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "silent", "panel": "shared" },
+            "problemMatcher": []
+        },
+        {
+            "label": "preview: php -S localhost:8001 -t dist",
+            "detail": "Serves dist/ exactly as GitHub Pages would — so demo/ URLs resolve.",
+            "type": "shell",
+            "command": "php",
+            "args": ["-S", "localhost:8001", "-t", "dist"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "isBackground": true,
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "problemMatcher": {
+                "owner": "php",
+                "pattern": { "regexp": "^.*$", "file": 1, "location": 2, "message": 3 },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": ".*PHP .* Development Server .* started.*",
+                    "endsPattern": ".*Development Server .* started.*"
+                }
+            }
+        }
+    ]
+}

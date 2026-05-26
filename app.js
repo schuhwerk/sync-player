@@ -1,0 +1,2706 @@
+// Sync player frontend. Reads window.CFG injected by index.php.
+// See AGENTS.md for region map.
+
+// ## js-config — CFG, api/loadBytes dispatch, navigate, SW registration
+const CFG = window.CFG;
+CFG.canWrite = !!CFG.canWrite;
+try { CFG.pw    = sessionStorage.getItem('spw_' + CFG.adapterId) || ''; } catch(e) {}
+try { CFG.appPw = sessionStorage.getItem('apw_' + CFG.adapterId) || ''; } catch(e) {}
+
+const _cloudUrlTemplate = CFG.cloudUrl || null;
+let _networkState = navigator.onLine ? 'online' : 'offline';
+const INSPECT_KEY = 'syncplayer.inspect';
+const INSPECT_MAX = 160;
+let _inspectEnabled = false;
+const _inspectEvents = [];
+
+function searchParams() {
+    return new URLSearchParams(location.search);
+}
+
+function pathFromLocation() {
+    return searchParams().get('path') || '/';
+}
+
+function hasInspectQuery() {
+    return searchParams().has('inspect');
+}
+
+CFG.path = pathFromLocation() || CFG.path || '/';
+
+const $ = id => document.getElementById(id);
+const fmt = s => { s = Math.max(0, s|0); return `${(s/60)|0}:${String(s%60).padStart(2,'0')}`; };
+const escapeHtml = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function syncNetworkIndicator() {
+    const el = $('net-ind');
+    if (!el) return;
+    const offline = _networkState !== 'online';
+    el.hidden = !offline;
+    el.title = offline ? 'Showing cached data while offline' : '';
+}
+
+function setNetworkState(state) {
+    _networkState = state === 'online' ? 'online' : 'offline';
+    syncNetworkIndicator();
+    inspect('network', { state: _networkState });
+}
+
+function inspect(type, detail) {
+    if (!_inspectEnabled) return;
+    const payload = typeof detail === 'function' ? detail() : (detail || {});
+    _inspectEvents.push({ at: new Date().toISOString(), type, path: CFG.path, ...payload });
+    if (_inspectEvents.length > INSPECT_MAX) {
+        _inspectEvents.splice(0, _inspectEvents.length - INSPECT_MAX);
+    }
+}
+
+function syncInspectUI() {
+    const btn = $('menu-inspect');
+    const info = $('menu-inspect-info');
+    const visible = hasInspectQuery();
+    if (btn) btn.hidden = !visible;
+    if (info) info.hidden = !visible;
+    if (!btn || !visible) return;
+    btn.classList.toggle('on', _inspectEnabled);
+    btn.setAttribute('aria-checked', String(_inspectEnabled));
+}
+
+function setInspectEnabled(on) {
+    _inspectEnabled = !!on;
+    try { localStorage.setItem(INSPECT_KEY, _inspectEnabled ? '1' : '0'); } catch(e) {}
+    syncInspectUI();
+    inspect('inspect', { enabled: _inspectEnabled });
+}
+
+function initInspect() {
+    let enabled = false;
+    if (hasInspectQuery()) {
+        try { enabled = localStorage.getItem(INSPECT_KEY) === '1'; } catch(e) {}
+        if (!enabled) enabled = searchParams().get('inspect') === '1';
+    }
+    _inspectEnabled = enabled;
+    syncInspectUI();
+}
+
+window.SyncInspect = {
+    enable() { setInspectEnabled(true); },
+    disable() { setInspectEnabled(false); },
+    clear() { _inspectEvents.length = 0; },
+    dump() { return _inspectEvents.slice(); },
+    get enabled() { return _inspectEnabled; },
+};
+
+// Backend dispatch: SyncBackend (browser-fs in single-file build) wins if present;
+// otherwise hit the PHP endpoints. Both must implement `api(mode, path, extra)` and
+// `loadBytes(path)`. Keeping the HTTP version inline keeps index.php a zero-dep deploy.
+
+// Builds the URLSearchParams for a PHP endpoint hit. Always carries `mode` + `path`;
+// adds the two passwords if set. Used by api/apiPost/loadBytes/fileHref.
+function qs(mode, path, extra) {
+    const p = new URLSearchParams({ mode, path });
+    if (extra) for (const k in extra) p.set(k, extra[k]);
+    if (CFG.pw)    p.set('password', CFG.pw);
+    if (CFG.appPw) p.set('app_password', CFG.appPw);
+    return p;
+}
+
+// Two distinct 401 shapes — app-level gate vs share-level. Hint comes from config
+// so the prompt can tell the user what to type.
+async function parseAuth(r) {
+    const body = await r.json().catch(() => ({}));
+    const key = body.error === 'app_password_required' ? '_appAuth' : '_auth';
+    return { [key]: true, hint: body.hint || '' };
+}
+
+function apiCacheKey(mode, path) {
+    if (mode === 'list' || mode === 'load-meta') return `${mode}::${path}`;
+    return null;
+}
+
+const api = window.SyncBackend?.api || (async (mode, path, extra) => {
+    // Cache list/search/meta in IDB so reloading offline still shows the last
+    // known content. We have two distinct failure modes to handle:
+    //   - true network failure: fetch() rejects (handled in catch).
+    //   - upstream failure: PHP returns 5xx + {error:"Error: N"} (the curl
+    //     to Nextcloud failed). The SW already falls back to its own cache on
+    //     5xx, but for cases the SW doesn't see (file://, first install, or
+    //     fresh cache), we also fall back here when data.error is set.
+    const cacheKey = apiCacheKey(mode, path, extra);
+    try {
+        const r = await fetch('?' + qs(mode, path, extra));
+        if (r.status === 401) return parseAuth(r);
+        const data = await r.json();
+        if (cacheKey && !data.error && !data._auth && !data._appAuth) listCachePut(cacheKey, data);
+        if (data.error && cacheKey) {
+            const cached = await listCacheGet(cacheKey);
+            if (cached) return { ...cached, _stale: true };
+        }
+        return data;
+    } catch (e) {
+        if (cacheKey) {
+            const cached = await listCacheGet(cacheKey);
+            if (cached) return { ...cached, _stale: true };
+        }
+        throw e;
+    }
+});
+
+async function fetchFreshList(path) {
+    const r = await fetch('?' + qs('list', path));
+    if (r.status === 401) return parseAuth(r);
+    const data = await r.json();
+    if (!data.error && !data._auth && !data._appAuth) listCachePut(`list::${path}`, data);
+    return data;
+}
+
+const apiPost = window.SyncBackend?.apiPost || (async (mode, path, body) => {
+    const r = await fetch('?' + qs(mode, path), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (r.status === 401) return parseAuth(r);
+    return r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+});
+
+const loadBytes = window.SyncBackend?.loadBytes
+    || (async path => {
+        try {
+            const r = await fetch('?' + qs('fetch', path));
+            if (!r.ok) {
+                setNetworkState(r.status >= 500 ? 'offline' : _networkState);
+                throw new Error(`HTTP ${r.status}`);
+            }
+            setNetworkState('online');
+            return r.arrayBuffer();
+        } catch (e) {
+            setNetworkState('offline');
+            inspect('audio:fetch-error', { path, message: e?.message || String(e) });
+            throw e;
+        }
+    });
+
+function fileHref(path, download = false) {
+    if (window.SyncBackend) return '#';
+    return '?' + qs('fetch', path, download ? { download: '1' } : null);
+}
+
+const dirHref = path => '?' + new URLSearchParams({ path });
+
+function currentCloudUrl() {
+    if (!_cloudUrlTemplate) return null;
+    try {
+        const url = new URL(_cloudUrlTemplate, location.href);
+        url.searchParams.set('dir', CFG.path || '/');
+        return url.toString();
+    } catch (_) {
+        return _cloudUrlTemplate;
+    }
+}
+
+// Keep folder navigation in-app for both builds so cached data stays usable offline
+// and we don't depend on reloading the shell + app.js for each folder click.
+function navigate(newPath) {
+    inspect('navigate', { from: CFG.path, to: newPath });
+    const params = searchParams();
+    params.set('path', newPath);
+    history.pushState(null, '', '?' + params.toString());
+    CFG.path = newPath;
+    init();
+}
+
+if ('serviceWorker' in navigator && location.protocol !== 'file:' && window.isSecureContext) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register(new URL('sw.js', location.href)).catch(() => {});
+    }, { once: true });
+}
+window.addEventListener('online', () => setNetworkState('online'));
+window.addEventListener('offline', () => setNetworkState('offline'));
+// ## js-cache — IndexedDB stores (waveforms, listings, pinned, audio), computePeaks
+// IndexedDB stores precomputed waveform peaks per file (Float32Array of length WF_PEAKS).
+// Key: `${path}::${lastModified}` — changing lm invalidates old peaks.
+// Encoded audio bytes use the browser HTTP cache (PHP forwards Cache-Control / Last-Modified).
+const WF_PEAKS = 1000;
+const DB_NAME = 'syncplayer';
+const STORE = 'waveforms', LIST_STORE = 'listings', PINNED_STORE = 'pinned', AUDIO_STORE = 'audio';
+const TREE_STORAGE_KEY = `syncplayer.tree::${CFG.adapterId || 'default'}`;
+const TREE_CRAWL_MAX_DEPTH = 1;
+
+let _dbPromise = null;
+const openDB = () => {
+    if (_dbPromise) return _dbPromise;
+    _dbPromise = new Promise((res, rej) => {
+        const r = indexedDB.open(DB_NAME, 3);
+        r.onupgradeneeded = () => {
+            const db = r.result;
+            if (!db.objectStoreNames.contains(STORE))        db.createObjectStore(STORE);
+            if (!db.objectStoreNames.contains(LIST_STORE))   db.createObjectStore(LIST_STORE);
+            if (!db.objectStoreNames.contains(PINNED_STORE)) db.createObjectStore(PINNED_STORE);
+            if (!db.objectStoreNames.contains(AUDIO_STORE))  db.createObjectStore(AUDIO_STORE);
+        };
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => { _dbPromise = null; rej(r.error); };
+    });
+    return _dbPromise;
+};
+
+const storeGet = async (store, key) => {
+    const db = await openDB();
+    return new Promise(res => {
+        const r = db.transaction(store).objectStore(store).get(key);
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => res(null);
+    });
+};
+
+const storePut = async (store, key, val) => {
+    const db = await openDB();
+    return new Promise(res => {
+        const tx = db.transaction(store, 'readwrite');
+        tx.objectStore(store).put(val, key);
+        tx.oncomplete = () => res();
+        tx.onerror = () => res();
+    });
+};
+
+const storeDel = async (store, key) => {
+    const db = await openDB();
+    return new Promise(res => {
+        const tx = db.transaction(store, 'readwrite');
+        tx.objectStore(store).delete(key);
+        tx.oncomplete = () => res();
+        tx.onerror = () => res();
+    });
+};
+
+const cacheGet      = key      => storeGet(STORE, key);
+const cachePut      = (key, v) => storePut(STORE, key, v);
+const listCacheGet  = key      => storeGet(LIST_STORE, key);
+const listCachePut  = (key, v) => storePut(LIST_STORE, key, v);
+const getPin        = path     => storeGet(PINNED_STORE, path);
+const setPin        = (p, v)   => storePut(PINNED_STORE, p, v);
+const delPin        = path     => storeDel(PINNED_STORE, path);
+const audioCacheGet = key      => storeGet(AUDIO_STORE, key);
+const audioCachePut = (key, v) => storePut(AUDIO_STORE, key, v);
+const audioCacheDel = key      => storeDel(AUDIO_STORE, key);
+const audioKey      = f        => `${f.path}::${f.lm || ''}`;
+
+const storeGetAllKeys = async (store) => {
+    const db = await openDB();
+    return new Promise(res => {
+        const r = db.transaction(store).objectStore(store).getAllKeys();
+        r.onsuccess = () => res(r.result || []);
+        r.onerror   = () => res([]);
+    });
+};
+
+// Set of folder paths currently pinned — loaded before each render so badges
+// show without an extra async round-trip inside renderFolderItems.
+let _pinnedPaths = new Set();
+async function loadPinnedPaths() {
+    _pinnedPaths = new Set(await storeGetAllKeys(PINNED_STORE));
+}
+
+// Per segment, max(|sample|) → one Float32. WF_PEAKS segments total.
+function computePeaks(audioBuffer, n = WF_PEAKS) {
+    const ch = audioBuffer.getChannelData(0);
+    const step = ch.length / n;
+    const peaks = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const start = (i * step) | 0;
+        const end = Math.min(ch.length, ((i + 1) * step) | 0);
+        let mx = 0;
+        for (let j = start; j < end; j++) { const v = Math.abs(ch[j]); if (v > mx) mx = v; }
+        peaks[i] = mx;
+    }
+    return peaks;
+}
+// ## js-tree — preload full folder tree from server; flat map used by filter + pin
+let _tree = null; // path → {folders, files, attachments}
+let _treeRefreshPromise = null;
+let _treeRefreshTimer = 0;
+
+function normalizeTreeEntry(data) {
+    return {
+        folders: Array.isArray(data?.folders) ? data.folders : [],
+        files: Array.isArray(data?.files) ? data.files : [],
+        attachments: Array.isArray(data?.attachments) ? data.attachments : [],
+    };
+}
+
+function treeEntrySize(entry) {
+    if (!entry) return 0;
+    return (entry.folders?.length || 0) + (entry.files?.length || 0) + (entry.attachments?.length || 0);
+}
+
+function treeEntry(path) {
+    return _tree?.[path] ? normalizeTreeEntry(_tree[path]) : null;
+}
+
+function saveTreeToLocalStorage(tree) {
+    try { localStorage.setItem(TREE_STORAGE_KEY, JSON.stringify(tree)); } catch (_) {}
+}
+
+function loadTreeFromLocalStorageSync() {
+    try {
+        const raw = localStorage.getItem(TREE_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' && Object.keys(parsed).length ? parsed : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function persistTree(tree) {
+    saveTreeToLocalStorage(tree);
+    await listCachePut('tree::/', tree);
+}
+
+function mergeTreeEntries(entries, options = {}) {
+    if (!entries || typeof entries !== 'object') return _tree;
+    const stalePaths = options.stalePaths || null;
+    const next = { ...(_tree || {}) };
+    for (const [path, incomingRaw] of Object.entries(entries)) {
+        const incoming = normalizeTreeEntry(incomingRaw);
+        const existing = next[path] ? normalizeTreeEntry(next[path]) : null;
+        if (stalePaths?.has(path) && existing && treeEntrySize(existing) > treeEntrySize(incoming)) {
+            continue;
+        }
+        next[path] = incoming;
+    }
+    _tree = next;
+    return _tree;
+}
+
+async function loadStoredTree() {
+    const fromLocalStorage = loadTreeFromLocalStorageSync();
+    if (fromLocalStorage) return fromLocalStorage;
+    const cached = await listCacheGet('tree::/');
+    if (cached && typeof cached === 'object' && Object.keys(cached).length) return cached;
+    return null;
+}
+
+async function updateTreeEntry(path, data) {
+    const next = mergeTreeEntries({ [path]: normalizeTreeEntry(data) });
+    await persistTree(_tree);
+    return next[path];
+}
+
+async function fetchTree() {
+    if (_treeRefreshPromise) return _treeRefreshPromise;
+    _treeRefreshPromise = (async () => {
+        const tree = {};
+        const stalePaths = new Set();
+        const visited = new Set();
+        const queue = [{ path: '/', depth: 0 }];
+        let isComplete = true;
+        while (queue.length) {
+            const next = queue.shift();
+            const path = next?.path;
+            const depth = next?.depth || 0;
+            if (!path || visited.has(path)) continue;
+            visited.add(path);
+            let data;
+            try { data = await fetchFreshList(path); } catch (_) { isComplete = false; continue; }
+            if (!data || data.error || data._auth || data._appAuth) { isComplete = false; continue; }
+            const entry = normalizeTreeEntry(data);
+            tree[path] = entry;
+            if (depth < TREE_CRAWL_MAX_DEPTH) {
+                for (const folder of entry.folders) {
+                    if (!visited.has(folder.path)) queue.push({ path: folder.path, depth: depth + 1 });
+                }
+            }
+        }
+        if (Object.keys(tree).length) {
+            mergeTreeEntries(tree, { stalePaths });
+            await persistTree(_tree);
+        }
+        return _tree;
+    })();
+    try {
+        return await _treeRefreshPromise;
+    } finally {
+        _treeRefreshPromise = null;
+    }
+}
+
+function refreshTreeInBackground() {
+    fetchTree().catch(() => {});
+}
+
+function scheduleTreeRefresh(delay = 180) {
+    if (window.SyncBackend || _treeRefreshPromise || _treeRefreshTimer) return;
+    _treeRefreshTimer = setTimeout(() => {
+        _treeRefreshTimer = 0;
+        refreshTreeInBackground();
+    }, delay);
+}
+
+async function loadTree() {
+    if (_tree) return;
+    const cached = await loadStoredTree();
+    if (cached) {
+        mergeTreeEntries(cached);
+        return;
+    }
+}
+
+// ## js-player — SyncPlayer: one AudioContext, sample-accurate sync, soft limiter
+// Web Audio sync player — patterned after chor-player/web-api-player.ts but trimmed.
+// One AudioContext, one gain node per track, sources recreated on play/seek (BufferSourceNodes are one-shot).
+class SyncPlayer {
+    constructor(files, onChange) {
+        this.files = files;
+        this.onChange = onChange;
+        this.ctx = null;
+        this.buffers = [];
+        this.peaks = [];
+        this.gains = [];
+        this.sources = [];
+        this.volumes = files.map(() => 1);
+        // Stage view's spatial attenuation per track, multiplied into the gain
+        // alongside volumes[i]. 1 when the stage is off — see js-stage.
+        this.stageAtten = files.map(() => 1);
+        this.maxVolume = 2;
+        this.duration = 0;
+        this.isPlay = false;
+        this.lastTick = 0;
+        this.currentTime = 0;
+        this.loadedFraction = 0;
+        this.loadError = '';
+        this.repeat = true;
+        this._rafId = 0;
+    }
+
+    _startTickLoop() {
+        if (this._rafId) return;
+        const loop = () => {
+            if (!this.isPlay) { this._rafId = 0; return; }
+            this._tick();
+            this._rafId = requestAnimationFrame(loop);
+        };
+        this._rafId = requestAnimationFrame(loop);
+    }
+    _stopTickLoop() {
+        if (this._rafId) { cancelAnimationFrame(this._rafId); this._rafId = 0; }
+    }
+
+    _ctx() {
+        if (!this.ctx) {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            // Soft limiter: stops sums of multiple tracks at >0 dBFS from clipping when master volume is pushed past 1.
+            const lim = this.ctx.createDynamicsCompressor();
+            lim.threshold.value = -3; lim.knee.value = 0; lim.ratio.value = 20;
+            lim.attack.value = 0.003; lim.release.value = 0.1;
+            lim.connect(this.ctx.destination);
+            this.limiter = lim;
+            // Browser can auto-suspend the context (tab backgrounding, BT device change,
+            // inactivity). When it resumes and we're supposed to be playing AND lost our
+            // sources, restart them — otherwise the UI shows "playing" but is silent.
+            // The `sources.length === 0` guard avoids racing with our own explicit
+            // resume() inside play(), which would otherwise double-start the sources.
+            this.ctx.addEventListener('statechange', () => {
+                if (this.ctx.state === 'running' && this.isPlay && this.sources.length === 0) {
+                    this._restartSources();
+                }
+            });
+        }
+        return this.ctx;
+    }
+    _emit() { this.onChange?.(this); }
+
+    async load() {
+        const total = this.files.length;
+        let loaded = 0;
+        this.loadError = '';
+        await Promise.all(this.files.map(async (f, i) => {
+            try {
+                const key = `${f.path}::${f.lm}`;
+                const cached = await cacheGet(key);
+                // Paint waveforms from IDB before audio decode finishes — the play
+                // button still gates on loadedFraction, but the page no longer looks
+                // like it's loading on a warm cache hit.
+                if (cached?.peaks) { this.peaks[i] = cached.peaks; this._emit(); }
+                // Prefer IDB-cached bytes (only populated when the user pins the
+                // folder). Falling back to loadBytes goes through the SW or
+                // adapter; nothing is written back to IDB unless the folder is
+                // pinned (pinFolder handles writeback explicitly).
+                const ak = audioKey(f);
+                let bytes = await audioCacheGet(ak);
+                if (!bytes) bytes = await loadBytes(f.path);
+                this.buffers[i] = await this._ctx().decodeAudioData(bytes);
+                if (!cached) {
+                    this.peaks[i] = computePeaks(this.buffers[i]);
+                    cachePut(key, { peaks: this.peaks[i] });
+                }
+                loaded++;
+            } catch (e) {
+                this.buffers[i] = null;
+                this.loadError = this.loadError || 'Audio unavailable while the source is offline.';
+                inspect('audio:track-unavailable', { path: f.path, message: e?.message || String(e) });
+            }
+            this.loadedFraction = total ? loaded / total : 1;
+            this._emit();
+        }));
+        const readyBuffers = this.buffers.filter(Boolean);
+        this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
+        this._emit();
+    }
+
+    _tick() {
+        if (!this.isPlay) return;
+        const now = performance.now() / 1000;
+        if (this.lastTick) this.currentTime += now - this.lastTick;
+        this.lastTick = now;
+        if (this.currentTime >= this.duration) {
+            if (this.repeat) { this.currentTime = 0; this._restartSources(); }
+            else { this.pause(); this.currentTime = this.duration; }
+        }
+        this._emit();
+    }
+
+    _restartSources() {
+        this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
+        this.sources = this.buffers.map((buf, i) => {
+            if (!buf) return null;
+            let g = this.gains[i];
+            if (!g) {
+                g = this.gains[i] = this._ctx().createGain();
+                g.connect(this.limiter); // connect once — repeated connects stack and inflate gain
+            }
+            g.gain.value = Math.min(this.maxVolume, this.volumes[i] * this.stageAtten[i]);
+            const src = this._ctx().createBufferSource();
+            src.buffer = buf;
+            src.connect(g);
+            src.start(0, this.currentTime);
+            return src;
+        }).filter(Boolean);
+    }
+
+    play() {
+        if (!this.buffers.some(Boolean)) return;
+        this._ctx().resume();
+        this._restartSources();
+        this.isPlay = true;
+        this.lastTick = performance.now() / 1000;
+        this._startTickLoop();
+        this._emit();
+    }
+    pause() {
+        if (!this.isPlay) return;
+        const now = performance.now() / 1000;
+        if (this.lastTick) this.currentTime += now - this.lastTick;
+        this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
+        this.sources = [];
+        this.isPlay = false;
+        this.lastTick = 0;
+        this._stopTickLoop();
+        // Release the audio hardware so Bluetooth output reverts to other apps.
+        // Browsers only drop the device when the context is suspended (or closed);
+        // a running context with no sources still holds the sink open.
+        try { this.ctx?.suspend(); } catch(e) {}
+        this._emit();
+    }
+    toggle() { this.isPlay ? this.pause() : this.play(); }
+    seek(delta) { this.jumpTo(this.currentTime + delta); }
+    jumpTo(sec) {
+        this.currentTime = Math.max(0, Math.min(this.duration, sec));
+        this.lastTick = this.isPlay ? performance.now() / 1000 : 0;
+        if (this.isPlay) this._restartSources();
+        this._emit();
+    }
+    setVolume(i, v) {
+        this.volumes[i] = v;
+        if (this.gains[i]) this.gains[i].gain.value = Math.min(this.maxVolume, v * this.stageAtten[i]);
+        this._emit();
+    }
+    setStageAttenuation(i, v) {
+        this.stageAtten[i] = v;
+        if (this.gains[i]) this.gains[i].gain.value = Math.min(this.maxVolume, this.volumes[i] * v);
+    }
+    setAllVolumes(v) { this.volumes.forEach((_, i) => this.setVolume(i, v)); }
+    toggleMute() {
+        this._preMuteAll ??= [];
+        const allMuted = this.volumes.every(v => v === 0);
+        if (allMuted) {
+            this.volumes.forEach((_, i) => this.setVolume(i, this._preMuteAll[i] ?? 1));
+            return;
+        }
+        this._preMuteAll = [...this.volumes];
+        this.setAllVolumes(0);
+    }
+    toggleTrackMute(i) {
+        // Stash the pre-mute volume so unmute can restore it. Default to 1 if track was already at 0.
+        this._preMute ??= [];
+        if (this.volumes[i] > 0) { this._preMute[i] = this.volumes[i]; this.setVolume(i, 0); }
+        else                    { this.setVolume(i, this._preMute[i] || 1); }
+    }
+    soloTrack(i) {
+        // If others are already silenced and this one alone is audible, restore everyone. Otherwise solo.
+        this._preMute ??= [];
+        const othersAllMuted = this.volumes.every((v, k) => k === i ? v > 0 : v === 0);
+        if (othersAllMuted) {
+            this.volumes.forEach((_, k) => { if (k !== i) this.setVolume(k, this._preMute[k] || 0.5); });
+        } else {
+            this.volumes.forEach((v, k) => {
+                if (k === i) { if (v === 0) this.setVolume(k, this._preMute[k] || 0.5); }
+                else { if (v > 0) this._preMute[k] = v; this.setVolume(k, 0); }
+            });
+        }
+    }
+    toggleRepeat() { this.repeat = !this.repeat; this._emit(); }
+    destroy() { this._stopTickLoop(); this.pause(); try { this.ctx?.close(); } catch(e) {} }
+}
+// ## js-waveform — precomputed peaks → DPR-aware canvas with played overlay
+const waveformLayerCache = new WeakMap();
+const waveformColorProbe = document.createElement('span');
+waveformColorProbe.style.cssText = 'position:absolute;inline-size:0;block-size:0;overflow:hidden;pointer-events:none;opacity:0';
+
+function resolveCssColor(value, fallback) {
+    if (!value) return fallback;
+    if (!waveformColorProbe.isConnected) document.documentElement.appendChild(waveformColorProbe);
+    waveformColorProbe.style.color = fallback;
+    waveformColorProbe.style.color = value;
+    return getComputedStyle(waveformColorProbe).color || fallback;
+}
+
+function waveformColors() {
+    const cs = getComputedStyle(document.documentElement);
+    return {
+        wave: resolveCssColor(cs.getPropertyValue('--wave').trim(), '#0082c9'),
+        played: resolveCssColor(cs.getPropertyValue('--wave-played').trim(), 'coral'),
+    };
+}
+
+// Cached colour + force-repaint flag. Invalidated on theme change, resize,
+// and tab visibility return (Firefox can drop canvas backing-store while hidden).
+let _cachedWaveformColors = null;
+let _wfFullRepaint = false;
+function getWaveformColors() {
+    if (!_cachedWaveformColors) _cachedWaveformColors = waveformColors();
+    return _cachedWaveformColors;
+}
+function invalidateWaveformPaint() {
+    _cachedWaveformColors = null;
+    _wfFullRepaint = true;
+}
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+        invalidateWaveformPaint();
+        if (player) onPlayerChange(player);
+    }
+});
+
+function buildWaveformLayer(peaks, w, h, dpr, color) {
+    const layer = document.createElement('canvas');
+    layer.width = w * dpr;
+    layer.height = h * dpr;
+    const ctx = layer.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const mid = h / 2, n = peaks.length;
+    let max = 0;
+    for (let i = 0; i < n; i++) if (peaks[i] > max) max = peaks[i];
+    const scale = max > 0 ? 1 / max : 1;
+    const barW = Math.max(1, w / n - 0.5);
+    ctx.fillStyle = color;
+    for (let i = 0; i < n; i++) {
+        if (peaks[i] <= 0) continue;
+        const x = (i / n) * w;
+        const a = Math.pow(peaks[i] * scale, 0.7) * (mid - 1);
+        ctx.fillRect(x, mid - a, barW, a * 2);
+    }
+    return layer;
+}
+
+function cachedWaveformLayers(peaks, w, h, dpr, colors) {
+    const key = `${w}x${h}@${dpr}:${colors.wave}:${colors.played}`;
+    let cached = waveformLayerCache.get(peaks);
+    if (!cached) {
+        cached = new Map();
+        waveformLayerCache.set(peaks, cached);
+    }
+    if (!cached.has(key)) {
+        cached.set(key, {
+            wave: buildWaveformLayer(peaks, w, h, dpr, colors.wave),
+            played: buildWaveformLayer(peaks, w, h, dpr, colors.played),
+        });
+    }
+    return cached.get(key);
+}
+
+// Always repaint — Firefox can drop canvas backing-store pixels (tab backgrounding,
+// GPU restart, memory pressure) while keeping width/height, so caching the paint
+// would leave bars invisible until a reflow.
+function paintWaveform(canvas, layer, w, h, dpr) {
+    if (!w || !h) return;
+    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+        canvas.width = w * dpr;
+        canvas.height = h * dpr;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(layer, 0, 0, w, h);
+}
+
+// Paint the bars onto both canvases. Returns false if layout isn't ready
+// yet (Firefox 0-width race). Caller can retry next frame.
+function paintTrackWaveform(trackEl, peaks, colors) {
+    const baseCanvas = trackEl._wfBase;
+    const playedWrap = trackEl._wfPlayedWrap;
+    const playedCanvas = trackEl._wfPlayedCanvas;
+    if (!baseCanvas || !playedWrap || !playedCanvas) return false;
+    const dpr = window.devicePixelRatio || 1;
+    let w = baseCanvas.clientWidth, h = baseCanvas.clientHeight;
+    if ((!w || !h) && trackEl._wf) { w = trackEl._wf.clientWidth; h = trackEl._wf.clientHeight; }
+    if (!w || !h) return false;
+    const layers = cachedWaveformLayers(peaks, w, h, dpr, colors);
+    paintWaveform(baseCanvas, layers.wave, w, h, dpr);
+    paintWaveform(playedCanvas, layers.played, w, h, dpr);
+    return true;
+}
+
+function updateTrackProgress(trackEl, played01) {
+    const playedWrap = trackEl._wfPlayedWrap;
+    if (!playedWrap) return;
+    playedWrap.style.setProperty('--played', `${Math.max(0, Math.min(1, played01)) * 100}%`);
+}
+// ## js-basetones — per-file base tones (note + freq), inline editor, cascade playback
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const NOTE_INDEX = new Map([
+    ['C', 0], ['B#', 0],
+    ['C#', 1], ['DB', 1],
+    ['D', 2],
+    ['D#', 3], ['EB', 3],
+    ['E', 4], ['FB', 4],
+    ['F', 5], ['E#', 5],
+    ['F#', 6], ['GB', 6],
+    ['G', 7],
+    ['G#', 8], ['AB', 8],
+    ['A', 9],
+    ['A#', 10], ['BB', 10],
+    ['B', 11], ['CB', 11],
+]);
+
+// Folder metadata: description + per-file base tones. Server splits storage into
+// readme.md (description) and .sync-player.json (tones); the wire shape is unified.
+// Tones are persisted as {note} only; freq is derived here.
+let baseTones = {};
+let metaDescription = '';
+// Optimistic-lock tokens from the last server load/save. Null = file expected absent;
+// string = expected token; false (default) = no expectation, write unconditionally.
+let metaVersions = { readme: false, sidecar: false };
+let metaEditMode = false;
+let baseToneDirty = false;
+let baseToneSaving = false;
+let baseToneStatus = '';
+let baseToneStatusError = false;
+let baseToneSaveTimer = 0;
+let baseToneVersion = 0;
+let baseToneSavedVersion = 0;
+let toneRunMode = '';
+let toneRunTimer = 0;
+let toneRunStops = [];
+
+const roundFreq = f => Math.round(f * 1000) / 1000;
+
+function clearToneRun() {
+    if (toneRunTimer) clearTimeout(toneRunTimer);
+    toneRunTimer = 0;
+    toneRunStops.splice(0).forEach(stop => stop());
+    toneRunMode = '';
+}
+
+function clearMetaSaveTimer() {
+    if (baseToneSaveTimer) clearTimeout(baseToneSaveTimer);
+    baseToneSaveTimer = 0;
+}
+
+function setBaseToneStatus(msg = '', isError = false) {
+    baseToneStatus = msg;
+    baseToneStatusError = isError;
+    syncBaseToneUI();
+}
+
+function freqToNote(freq) {
+    const semis = Math.round(12 * Math.log2(freq / 440));
+    const midi = 69 + semis;
+    const name = NOTE_NAMES[((midi % 12) + 12) % 12];
+    const octave = Math.floor(midi / 12) - 1;
+    return `${name}${octave}`;
+}
+
+function noteToFreq(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    if (/^\d+(\.\d+)?$/.test(raw)) {
+        const hz = Number(raw);
+        return Number.isFinite(hz) && hz >= 20 && hz <= 20000 ? hz : null;
+    }
+    const m = raw.match(/^([A-Ga-g])([#bB]?)(-?\d+)$/);
+    if (!m) return null;
+    const note = (m[1].toUpperCase() + (m[2] || '')).toUpperCase();
+    const octave = Number(m[3]);
+    const idx = NOTE_INDEX.get(note);
+    if (idx == null) return null;
+    const midi = (octave + 1) * 12 + idx;
+    return 440 * 2 ** ((midi - 69) / 12);
+}
+
+const shiftHalftone = (freq, steps) => freq * 2 ** (steps / 12);
+
+function canonicalTone(freq) {
+    const rounded = roundFreq(freq);
+    return { note: freqToNote(rounded), freq: rounded };
+}
+
+function toneForFile(name) {
+    const tone = baseTones[name];
+    return tone && Number.isFinite(tone.freq) ? tone : null;
+}
+
+function serializeMeta() {
+    const tones = Object.fromEntries(
+        Object.keys(baseTones).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
+            .map(name => [name, { note: canonicalTone(baseTones[name].freq).note }])
+    );
+    // Only include version keys the server actually gave us (false = unknown, omit).
+    const versions = {};
+    if (metaVersions.readme  !== false) versions.readme  = metaVersions.readme;
+    if (metaVersions.sidecar !== false) versions.sidecar = metaVersions.sidecar;
+    return { description: metaDescription, tones, versions };
+}
+
+function renderBaseToneControl(name) {
+    const tone = toneForFile(name);
+    const title = tone ? `${tone.note} (${tone.freq.toFixed(3)} Hz)` : '';
+    const canEditCls = CFG.canWrite ? ' can-edit' : '';
+    const editor = CFG.canWrite ? `<div class="bt-edit">
+        <button type="button" class="btn bt-step bt-down" title="Lower by one semitone">♭</button>
+        <input class="bt-input" type="text" value="${escapeHtml(tone?.note || '')}" placeholder="G4" inputmode="text" spellcheck="false" aria-label="Base tone for ${escapeHtml(name)}">
+        <button type="button" class="btn bt-step bt-up" title="Raise by one semitone">♯</button>
+        <button type="button" class="btn bt-clear" title="Clear base tone"${tone ? '' : ' disabled'}>clear</button>
+    </div>` : '';
+    return `<div class="bt-wrap${canEditCls}">
+        <button type="button" class="btn bt-badge" title="${escapeHtml(title)}"${tone ? '' : ' hidden'}>${escapeHtml(tone?.note || '')}</button>
+        ${editor}
+    </div>`;
+}
+
+function syncBaseToneUI() {
+    if (!player) return;
+
+    player.files.forEach((file, i) => {
+        const tr = document.querySelector(`.track[data-i="${i}"]`);
+        if (!tr) return;
+        const tone = toneForFile(file.name);
+        const badge = tr.querySelector('.bt-badge');
+        const clear = tr.querySelector('.bt-clear');
+        const input = tr.querySelector('.bt-input');
+        if (badge) {
+            badge.textContent = tone?.note || '';
+            badge.hidden = !tone;
+            badge.title = tone ? `${tone.note} (${tone.freq.toFixed(3)} Hz)` : '';
+        }
+        if (clear) clear.disabled = !tone;
+        if (input && document.activeElement !== input) input.value = tone?.note || '';
+    });
+
+    const toneCount = player.files.reduce((n, f) => n + (toneForFile(f.name) ? 1 : 0), 0);
+    const hasCascade = toneCount >= 2;
+    const cascadeBtn = $('bt-cascade');
+    const status = $('bt-status');
+    const toneBusy = !!toneRunMode;
+
+    if (cascadeBtn) {
+        cascadeBtn.hidden = !hasCascade;
+        cascadeBtn.disabled = !hasCascade || toneBusy;
+    }
+    if (status) {
+        status.textContent = baseToneStatus;
+        status.classList.toggle('error', !!baseToneStatus && baseToneStatusError);
+    }
+}
+
+function resetMetaState() {
+    clearToneRun();
+    clearMetaSaveTimer();
+    baseToneDirty = false;
+    baseToneSaving = false;
+    baseToneStatus = '';
+    baseToneStatusError = false;
+    baseTones = {};
+    metaDescription = '';
+    metaVersions = { readme: false, sidecar: false };
+    baseToneVersion = 0;
+    baseToneSavedVersion = 0;
+    setSaveIndicator('idle');
+}
+
+// Server-supplied optimistic-lock tokens. `false` → unknown (don't send); a
+// string → expected ETag/mtime; `null` → expect file absent.
+function applyMetaVersions(v) {
+    if (!v || typeof v !== 'object') return;
+    metaVersions = { readme: v.readme ?? null, sidecar: v.sidecar ?? null };
+}
+
+// Pure: takes a meta payload (from network or IDB) and pushes it into module state.
+// Returns true if the payload was applied, false if it was an auth/error envelope.
+function applyMetaPayload(res) {
+    if (!res || res._appAuth || res._auth || res.error) return false;
+    metaDescription = typeof res?.description === 'string' ? res.description : '';
+    const tones = {};
+    for (const [name, tone] of Object.entries(res?.tones || {})) {
+        const note = typeof tone?.note === 'string' ? tone.note.trim() : '';
+        const freq = noteToFreq(note);
+        if (!Number.isFinite(freq)) continue;
+        tones[name] = canonicalTone(freq);
+    }
+    baseTones = tones;
+    applyMetaVersions(res?.versions);
+    return true;
+}
+
+async function loadFolderMeta(folderPath) {
+    resetMetaState();
+    const res = await api('load-meta', folderPath);
+    if (res._appAuth || res._auth || res.error) return res;
+    applyMetaPayload(res);
+    return {};
+}
+
+async function saveFolderMeta(folderPath, snapshot, saveVersion) {
+    if (!CFG.canWrite) return { error: 'This source is read-only' };
+    if (baseToneSaving) return { ok: true };
+    baseToneSaving = true;
+    setSaveIndicator('saving');
+    syncBaseToneUI();
+    const res = await apiPost('save-meta', folderPath, snapshot);
+    baseToneSaving = false;
+    if (res._appAuth || res._auth || res.error) {
+        setSaveIndicator(res.error ? 'error' : 'idle');
+        syncBaseToneUI();
+        return res;
+    }
+    applyMetaVersions(res?.versions);
+    baseToneSavedVersion = Math.max(baseToneSavedVersion, saveVersion);
+    baseToneDirty = baseToneVersion !== baseToneSavedVersion;
+    if (baseToneDirty) {
+        setSaveIndicator('saving');
+        scheduleMetaSave();
+    } else {
+        setSaveIndicator('saved');
+    }
+    return res;
+}
+
+async function flushMetaSave() {
+    clearMetaSaveTimer();
+    if (!CFG.canWrite || !baseToneDirty || baseToneSaving) return;
+    const snapshot = serializeMeta();
+    const saveVersion = baseToneVersion;
+    const res = await saveFolderMeta(CFG.path, snapshot, saveVersion);
+    if (handleAuth(res)) return;
+    if (res.error === 'conflict') { await handleMetaConflict(saveVersion); return; }
+    if (res.error)    setBaseToneStatus(res.error, true);
+}
+
+// Triggered when the server rejects a save because readme.md or .sync-player.json
+// was changed elsewhere. OK = our edits win (force). Cancel = discard, reload theirs.
+async function handleMetaConflict(saveVersion) {
+    const keepMine = window.confirm(
+        'This folder\'s description or base tones were changed elsewhere since you opened it.\n\n' +
+        'OK   – overwrite the remote version with your changes\n' +
+        'Cancel – discard your changes and reload the remote version'
+    );
+    if (keepMine) {
+        const snapshot = { ...serializeMeta(), force: true };
+        const res = await saveFolderMeta(CFG.path, snapshot, saveVersion);
+        if (res.error) setBaseToneStatus(res.error, true);
+        return;
+    }
+    // Discard local edits — clear dirty flags and reload.
+    baseToneDirty = false;
+    baseToneSavedVersion = baseToneVersion;
+    const meta = await loadFolderMeta(CFG.path);
+    if (handleAuth(meta)) return;
+    if (meta.error)    { setBaseToneStatus(meta.error, true); return; }
+    syncDescriptionUI();
+    syncBaseToneUI();
+    setSaveIndicator('idle');
+}
+
+function scheduleMetaSave(delay = 900) {
+    if (!CFG.canWrite || !baseToneDirty) return;
+    clearMetaSaveTimer();
+    baseToneSaveTimer = setTimeout(() => { flushMetaSave(); }, delay);
+}
+
+function markMetaDirty() {
+    baseToneVersion++;
+    baseToneDirty = CFG.canWrite && baseToneVersion !== baseToneSavedVersion;
+    if (CFG.canWrite) {
+        setSaveIndicator('saving');
+        scheduleMetaSave();
+    }
+}
+
+function setFolderDescription(text) {
+    const next = String(text || '');
+    if (next === metaDescription) return;
+    metaDescription = next;
+    markMetaDirty();
+    setBaseToneStatus('');
+    syncDescriptionUI();
+}
+
+function syncDescriptionUI() {
+    const edit = $('descr-edit');
+    if (!edit) return;
+    if (document.activeElement !== edit) edit.value = metaDescription;
+    const view = $('descr-view');
+    if (view) view.innerHTML = linkifyText(metaDescription || '');
+    const ro = !(metaEditMode && CFG.canWrite);
+    edit.readOnly = ro;
+    if (!CSS.supports?.('field-sizing', 'content')) autosizeTextarea(edit);
+}
+
+function playTone(freq, durationMs = 720) {
+    if (!player || !Number.isFinite(freq)) return () => {};
+    const ctx = player._ctx();
+    ctx.resume();
+    const mix = ctx.createGain();
+    // Track #mvol: scale by the same average the master slider reflects, then a fixed boost so tones cut over the mix.
+    const masterVol = player.volumes.length
+        ? player.volumes.reduce((a, b) => a + b, 0) / player.volumes.length
+        : 1;
+    mix.gain.value = 1.8 * masterVol;
+    const filter = ctx.createBiquadFilter();
+    // All partials sit on the fundamental — no +octave/+2-octave layers — so the ear can only lock to f.
+    // Triangle carries the body; the quiet sawtooth adds harmonic series for a clear "hook" without octave ambiguity.
+    const partials = [
+        { type: 'triangle', level: 0.18 },
+        { type: 'sawtooth', level: 0.05 },
+    ];
+    const voices = partials.map(part => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = part.type;
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+        gain.gain.linearRampToValueAtTime(part.level, ctx.currentTime + 0.008);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, part.level * 0.28), ctx.currentTime + 0.09);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + durationMs / 1000);
+        osc.connect(gain);
+        gain.connect(mix);
+        return { osc, gain };
+    });
+    let stopped = false;
+    const stopAt = ctx.currentTime + durationMs / 1000;
+    const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        voices.forEach(({ osc, gain }) => {
+            try { osc.stop(); } catch(e) {}
+            osc.disconnect();
+            gain.disconnect();
+        });
+        mix.disconnect();
+        filter.disconnect();
+    };
+
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(Math.min(2600, Math.max(900, freq * 4)), ctx.currentTime);
+    filter.Q.value = 0.8;
+    mix.connect(filter);
+    filter.connect(player.limiter || ctx.destination);
+    voices.forEach(({ osc }) => {
+        osc.start();
+        osc.stop(stopAt + 0.02);
+        osc.onended = stop;
+    });
+    return stop;
+}
+
+function playTrackTone(name) {
+    clearToneRun();
+    syncBaseToneUI();
+    const tone = toneForFile(name);
+    if (!tone) return;
+    playTone(tone.freq);
+}
+
+function setTrackTone(name, freq, play = false) {
+    if (!Number.isFinite(freq) || freq < 20 || freq > 20000) return false;
+    const next = canonicalTone(freq);
+    const prev = toneForFile(name);
+    if (!prev || prev.freq !== next.freq) {
+        baseTones = { ...baseTones, [name]: next };
+        markMetaDirty();
+    }
+    setBaseToneStatus('');
+    syncBaseToneUI();
+    if (play) playTone(next.freq);
+    return true;
+}
+
+function clearTrackTone(name) {
+    if (!(name in baseTones)) return;
+    const next = { ...baseTones };
+    delete next[name];
+    baseTones = next;
+    markMetaDirty();
+    setBaseToneStatus('');
+    syncBaseToneUI();
+}
+
+function currentToneFiles() {
+    return player ? player.files.map(f => ({ ...f, tone: toneForFile(f.name) })).filter(f => f.tone) : [];
+}
+
+function runCascade() {
+    if (toneRunMode) return;
+    const tones = currentToneFiles();
+    if (tones.length < 2) return;
+    clearToneRun();
+    toneRunMode = 'cascade';
+    syncBaseToneUI();
+    const step = idx => {
+        if (toneRunMode !== 'cascade') return;
+        if (idx >= tones.length) {
+            clearToneRun();
+            syncBaseToneUI();
+            return;
+        }
+        toneRunStops = [playTone(tones[idx].tone.freq, 520)];
+        toneRunTimer = setTimeout(() => step(idx + 1), 420);
+    };
+    step(0);
+}
+// ## js-offline — opt-in "Available offline" pin, eager fetch + IDB audio cache
+// Opt-in offline cache. Pinning a folder eagerly fetches every audio file +
+// attachment via loadBytes and stores the bytes in the AUDIO_STORE, keyed by
+// `${path}::${lm}`. SyncPlayer.load checks that store first, so on later
+// offline visits the bytes come straight from IDB even if the SW Cache layer
+// got evicted. Listings + meta are cached passively by api() — pinning just
+// ensures the audio is there too.
+//
+// State for the current folder is stored in `_pinState` so the menu UI can
+// reflect caching progress without re-querying IDB on every tick.
+let _pinState = { pinned: false, caching: false, done: 0, total: 0, error: '' };
+
+async function refreshPinState() {
+    const pin = await getPin(CFG.path);
+    _pinState = { ..._pinState, pinned: !!pin, caching: false, error: '' };
+    syncOfflineUI();
+}
+
+function offlineCandidates() {
+    const data = _lastRenderData || {};
+    return [...(data.files || []), ...(data.attachments || [])];
+}
+
+async function pinCurrentFolder() {
+    if (window.SyncBackend) return; // single-file build: files are already local
+    const directItems = offlineCandidates();
+    const directFolders = _lastRenderData?.folders || [];
+    if (!directItems.length && !directFolders.length) return;
+    // Ask the browser to keep our storage around — without this, IDB can be
+    // evicted under storage pressure, which would defeat the point of pinning.
+    try { await navigator.storage?.persist?.(); } catch (_) {}
+
+    // fetchTree crawls all subfolders and writes each listing to IDB via api()
+    // side-effects — making every folder navigable offline.
+    _pinState = { pinned: true, caching: true, done: 0, total: 0, error: '' };
+    syncOfflineUI();
+
+    if (!_tree) await fetchTree().catch(() => {});
+
+    const pfx = CFG.path;
+    const allItems = _tree
+        ? Object.entries(_tree)
+            .filter(([p]) => pfx === '/' || p === pfx || p.startsWith(pfx + '/'))
+            .flatMap(([, e]) => [...(e.files || []), ...(e.attachments || [])])
+        : [...directItems]; // fetchTree failed; fall back to direct items only
+
+    if (!allItems.length) { _pinState.caching = false; syncOfflineUI(); return; }
+
+    _pinState.total = allItems.length;
+    syncOfflineUI();
+    // Persist the pin marker first, so a reload mid-caching still shows the
+    // folder as pinned (resuming would happen on a future visit).
+    await setPin(CFG.path, {
+        pinnedAt: Date.now(),
+        items: allItems.map(f => ({ path: f.path, lm: f.lm, name: f.name, kind: f.kind || 'audio' })),
+    });
+    for (const f of allItems) {
+        const key = audioKey(f);
+        try {
+            let bytes = await audioCacheGet(key);
+            if (!bytes) bytes = await loadBytes(f.path);
+            await audioCachePut(key, bytes);
+        } catch (e) {
+            _pinState.error = e?.message || String(e);
+        }
+        _pinState.done++;
+        syncOfflineUI();
+    }
+    _pinState.caching = false;
+    syncOfflineUI();
+    await loadPinnedPaths();
+    rerenderFolderBadges();
+}
+
+async function unpinCurrentFolder() {
+    const pin = await getPin(CFG.path);
+    if (!pin) return;
+    await delPin(CFG.path);
+    for (const f of pin.items || []) {
+        await audioCacheDel(audioKey(f));
+    }
+    _pinState = { pinned: false, caching: false, done: 0, total: 0, error: '' };
+    syncOfflineUI();
+    await loadPinnedPaths();
+    rerenderFolderBadges();
+}
+
+async function toggleCurrentPin() {
+    if (_pinState.caching) return;
+    if (_pinState.pinned) {
+        const ok = window.confirm('Remove this folder\'s offline copy?\n\nThe audio files will be re-downloaded on the next visit.');
+        if (!ok) return;
+        await unpinCurrentFolder();
+    } else {
+        await pinCurrentFolder();
+    }
+}
+
+function syncOfflineUI() {
+    const btn = $('menu-offline');
+    const info = $('menu-offline-info');
+    if (!btn) return;
+    // Single-file/browser-fs build serves files from local disk — caching them
+    // again would be pure overhead, so the toggle is meaningless there.
+    // Show for folder-only views too: pin will recurse into sub-folders to find audio.
+    const eligible = !window.SyncBackend && (offlineCandidates().length > 0 || (_lastRenderData?.folders?.length > 0));
+    btn.hidden = !eligible;
+    if (info) info.hidden = !eligible;
+    if (!eligible) return;
+    btn.classList.toggle('on', _pinState.pinned || _pinState.caching);
+    btn.setAttribute('aria-checked', String(_pinState.pinned));
+    btn.disabled = _pinState.caching;
+    const lbl = btn.querySelector('.lbl');
+    if (lbl) {
+        if (_pinState.caching) {
+            lbl.textContent = _pinState.total > 0
+                ? `Caching ${_pinState.done} / ${_pinState.total}…`
+                : 'Preparing…';
+        } else if (_pinState.pinned) {
+            lbl.textContent = 'Available offline';
+        } else {
+            lbl.textContent = 'Make available offline';
+        }
+    }
+    if (info) {
+        if (_pinState.error) info.textContent = 'Some files failed: ' + _pinState.error;
+        else if (_pinState.pinned) info.textContent = 'Audio + waveforms stored in your browser. Tap to remove.';
+        else info.textContent = 'Download all audio in this folder for offline playback.';
+    }
+}
+// ## js-stage — spatial mix: tracks on a circle + draggable listener, distance sets volume
+// Each track sits in a normalized [0..1] square. Distance from track to listener
+// drives an equal-power falloff (cos curve). Past the per-track audibility radius
+// the track is fully muted. Stage attenuation multiplies into SyncPlayer's gain
+// next to the user's volume slider, so the slider keeps acting as a ceiling.
+const STAGE_ENABLED_KEY = 'syncplayer.stage.enabled';
+const STAGE_CIRCLE_R = 0.18;                        // default placement radius (square-normalized)
+// Audibility radius = 1.5 × placement radius. Anchors the falloff so:
+//   d = 0   (on the track)         → v = 1
+//   d = a   (default listener pos) → v = cos(π/3) = 0.5
+//   d = 1.5a                       → v = 0  (mute boundary)
+const STAGE_AUDIBLE_R = STAGE_CIRCLE_R * 1.5;
+
+let _stageOn = false;
+let _stageState = null;          // {listener:{x,y}, tracks:{[name]:{x,y}}, fingerprint}
+let _stagePersistTimer = 0;
+
+const stageKey = () => `syncplayer.stage::${CFG.adapterId || 'default'}::${CFG.path}`;
+// Radii are part of the fingerprint so tuning them invalidates saved positions —
+// otherwise old defaults stick around against new audibility rings.
+const stageFingerprint = files =>
+    `r${STAGE_CIRCLE_R}-${STAGE_AUDIBLE_R}|`
+    + files.map(f => `${f.name}::${f.lm || ''}`).join('|');
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+
+function stageDefaults(files) {
+    const tracks = {};
+    const n = files.length;
+    for (let i = 0; i < n; i++) {
+        const a = -Math.PI / 2 + (i * 2 * Math.PI / n);
+        tracks[files[i].name] = {
+            x: 0.5 + STAGE_CIRCLE_R * Math.cos(a),
+            y: 0.5 + STAGE_CIRCLE_R * Math.sin(a),
+        };
+    }
+    return { listener: { x: 0.5, y: 0.5 }, tracks, fingerprint: stageFingerprint(files) };
+}
+
+// Reset to defaults if the saved fingerprint doesn't match the current files —
+// adding, removing or replacing tracks invalidates the stored positions.
+function loadStageStateFor(files) {
+    const fp = stageFingerprint(files);
+    try {
+        const raw = localStorage.getItem(stageKey());
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed?.fingerprint === fp && parsed.tracks && parsed.listener) {
+                const def = stageDefaults(files);
+                for (const name of Object.keys(def.tracks)) {
+                    if (!parsed.tracks[name]) parsed.tracks[name] = def.tracks[name];
+                }
+                return parsed;
+            }
+        }
+    } catch (_) {}
+    return stageDefaults(files);
+}
+
+function persistStageSoon() {
+    if (_stagePersistTimer) return;
+    _stagePersistTimer = setTimeout(() => {
+        _stagePersistTimer = 0;
+        try { localStorage.setItem(stageKey(), JSON.stringify(_stageState)); } catch (_) {}
+    }, 250);
+}
+function persistStageNow() {
+    if (_stagePersistTimer) { clearTimeout(_stagePersistTimer); _stagePersistTimer = 0; }
+    try { localStorage.setItem(stageKey(), JSON.stringify(_stageState)); } catch (_) {}
+}
+
+// Pure cos falloff from v=1 at the track to v=0 at the audibility ring.
+function stageTrackVolume(trackPos, listener) {
+    const d = Math.hypot(trackPos.x - listener.x, trackPos.y - listener.y);
+    if (d >= STAGE_AUDIBLE_R) return 0;
+    return Math.cos(Math.PI / 2 * (d / STAGE_AUDIBLE_R));
+}
+
+function applyStageTrack(i) {
+    if (!player || !_stageState) return;
+    const tp = _stageState.tracks[player.files[i].name];
+    if (!tp) return;
+    const v = _stageOn ? stageTrackVolume(tp, _stageState.listener) : 1;
+    player.setStageAttenuation(i, v);
+    const g = document.querySelector(`.stage-track[data-i="${i}"]`);
+    if (g) g.style.setProperty('--stage-vol', v.toFixed(3));
+    // Mirror the effective volume on the slider at the top while dragging — the
+    // player doesn't emit on stage moves, so onPlayerChange wouldn't pick this up.
+    const tr = _trackEls[i];
+    if (!tr) return;
+    const eff = player.volumes[i] * v;
+    const pct = (eff * 100) | 0;
+    const slider = tr._tvol;
+    if (slider && document.activeElement !== slider) slider.value = pct;
+    if (tr._volNum) tr._volNum.textContent = pct;
+    tr.classList.toggle('muted', eff === 0);
+}
+function applyStageAll() {
+    if (!player) return;
+    for (let i = 0; i < player.files.length; i++) applyStageTrack(i);
+}
+
+function renderStage(files) {
+    if (!files.length) return '';
+    const tracksSVG = files.map((f, i) => {
+        const label = escapeHtml(f.name.replace(/\.[^.]+$/, '').slice(0, 14));
+        return `<g class="stage-track" data-i="${i}">
+            <circle class="stage-track-outer" r="${(STAGE_AUDIBLE_R * 100).toFixed(2)}"/>
+            <circle class="stage-track-dot" r="3"/>
+            <text class="stage-track-label" y="-5.5" text-anchor="middle">${label}</text>
+        </g>`;
+    }).join('');
+    return `<div class="stage" id="stage" aria-label="Spatial mix">
+        <div class="stage-head">
+            <span class="stage-hint">Drag tracks and the listener. Volume rises as the listener moves closer; outside a track's ring is mute. Tap empty space to teleport the listener.</span>
+            <button type="button" class="btn stage-reset" id="stage-reset">Reset</button>
+        </div>
+        <div class="stage-canvas">
+            <svg id="stage-svg" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+                <g class="stage-tracks">${tracksSVG}</g>
+                <g class="stage-listener" id="stage-listener">
+                    <circle class="stage-listener-halo" r="8"/>
+                    <circle class="stage-listener-dot" r="3.5"/>
+                </g>
+            </svg>
+        </div>
+    </div>`;
+}
+
+function setStageTrackPos(i, x, y) {
+    const g = document.querySelector(`.stage-track[data-i="${i}"]`);
+    if (g) g.setAttribute('transform', `translate(${(x * 100).toFixed(3)},${(y * 100).toFixed(3)})`);
+}
+function setStageListenerPos(x, y) {
+    const g = $('stage-listener');
+    if (g) g.setAttribute('transform', `translate(${(x * 100).toFixed(3)},${(y * 100).toFixed(3)})`);
+}
+
+// Pointer-capture drag. The SVG's bounding rect is captured at pointerdown so
+// the drag doesn't tear if the page reflows mid-drag.
+function bindStageDrag(el, onMove) {
+    el.addEventListener('pointerdown', e => {
+        if (e.button !== undefined && e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const svg = $('stage-svg');
+        if (!svg) return;
+        const rect = svg.getBoundingClientRect();
+        try { el.setPointerCapture(e.pointerId); } catch (_) {}
+        const move = ev => onMove(
+            clamp01((ev.clientX - rect.left) / rect.width),
+            clamp01((ev.clientY - rect.top) / rect.height),
+        );
+        move(e);
+        const up = () => {
+            try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+            el.removeEventListener('pointermove', move);
+            el.removeEventListener('pointerup', up);
+            el.removeEventListener('pointercancel', up);
+            persistStageNow();
+        };
+        el.addEventListener('pointermove', move);
+        el.addEventListener('pointerup', up);
+        el.addEventListener('pointercancel', up);
+    });
+}
+
+function bindStage(files) {
+    const svg = $('stage-svg');
+    if (!svg) return;
+    files.forEach((f, i) => {
+        const p = _stageState.tracks[f.name];
+        if (p) setStageTrackPos(i, p.x, p.y);
+    });
+    setStageListenerPos(_stageState.listener.x, _stageState.listener.y);
+    applyStageAll();
+
+    files.forEach((f, i) => {
+        const g = svg.querySelector(`.stage-track[data-i="${i}"]`);
+        if (!g) return;
+        bindStageDrag(g, (x, y) => {
+            _stageState.tracks[f.name] = { x, y };
+            setStageTrackPos(i, x, y);
+            applyStageTrack(i);
+            persistStageSoon();
+        });
+    });
+    const listener = $('stage-listener');
+    if (listener) bindStageDrag(listener, (x, y) => {
+        _stageState.listener = { x, y };
+        setStageListenerPos(x, y);
+        applyStageAll();
+        persistStageSoon();
+    });
+
+    // Tap on empty space teleports the listener — handy on mobile where dragging
+    // the small listener dot is fiddly. Track / listener pointerdowns stopProp
+    // so they don't double-fire this.
+    svg.addEventListener('pointerdown', e => {
+        if (e.target.closest('.stage-track') || e.target.closest('.stage-listener')) return;
+        const rect = svg.getBoundingClientRect();
+        _stageState.listener = {
+            x: clamp01((e.clientX - rect.left) / rect.width),
+            y: clamp01((e.clientY - rect.top) / rect.height),
+        };
+        setStageListenerPos(_stageState.listener.x, _stageState.listener.y);
+        applyStageAll();
+        persistStageNow();
+    });
+
+    $('stage-reset')?.addEventListener('click', () => {
+        _stageState = stageDefaults(player.files);
+        player.files.forEach((f, i) => {
+            const p = _stageState.tracks[f.name];
+            setStageTrackPos(i, p.x, p.y);
+        });
+        setStageListenerPos(_stageState.listener.x, _stageState.listener.y);
+        applyStageAll();
+        persistStageNow();
+    });
+}
+
+function initStage(files) {
+    if (!files?.length) return;
+    _stageState = loadStageStateFor(files);
+    bindStage(files);
+}
+
+function applyStageEnabled(on) {
+    _stageOn = !!on;
+    document.body.classList.toggle('stage-on', _stageOn);
+    try { localStorage.setItem(STAGE_ENABLED_KEY, _stageOn ? '1' : '0'); } catch (_) {}
+    const btn = $('menu-stage');
+    if (btn) {
+        btn.classList.toggle('on', _stageOn);
+        btn.setAttribute('aria-checked', String(_stageOn));
+    }
+    applyStageAll();
+}
+
+function initStageEnabled() {
+    let v = '1';
+    try { v = localStorage.getItem(STAGE_ENABLED_KEY) ?? '1'; } catch (_) {}
+    applyStageEnabled(v === '1');
+}
+// ## js-ui — init/SWR, renderView, controls, attachments, keyboard
+let player = null;
+
+// Cached DOM refs — rebuilt on every renderView so the per-tick onPlayerChange
+// path skips querySelector. Cleared when the player goes away.
+let _trackEls = [];
+let _ui = {};
+function cacheTrackElements(trackEl) {
+    trackEl._wfBase = trackEl.querySelector('.wf-base');
+    trackEl._wfPlayedWrap = trackEl.querySelector('.wf-played');
+    trackEl._wfPlayedCanvas = trackEl._wfPlayedWrap?.querySelector('canvas');
+    trackEl._wf = trackEl.querySelector('.wf');
+    trackEl._tvol = trackEl.querySelector('.tvol');
+    trackEl._volNum = trackEl.querySelector('.vol-num');
+    trackEl._paintedPeaks = null;
+}
+function cachePlayerUI() {
+    const seek = $('seek');
+    _ui = {
+        seek,
+        loadFill: seek?.querySelector('i'),
+        playFill: seek?.querySelector('b'),
+        play: $('play'),
+        back5: $('back5'),
+        fwd5: $('fwd5'),
+        time: $('time'),
+        playIc: $('play-ic'),
+        rep: $('rep'),
+        mvol: $('mvol'),
+        masterWrap: document.querySelector('.master-inner .vol-wrap'),
+    };
+}
+function clearPlayerUICache() { _trackEls = []; _ui = {}; }
+
+function setHeader() {
+    const segs = CFG.path.split('/').filter(Boolean);
+    $('back').style.display = segs.length ? '' : 'none';
+    const headerTitle = segs.length ? segs[segs.length - 1] : (CFG.title || 'Sync Player');
+    $('ti').textContent = headerTitle;
+    document.title = headerTitle;
+    syncNetworkIndicator();
+
+    const clearDemo = $('clear-demo');
+    clearDemo.style.display = window.SyncBackend?.ready?.() ? '' : 'none';
+
+    const cloud = $('menu-cloud');
+    if (cloud) {
+        const url = currentCloudUrl();
+        if (url) { cloud.href = url; cloud.hidden = false; }
+        else { cloud.removeAttribute('href'); cloud.hidden = true; }
+    }
+}
+
+function navUp() {
+    if (attachmentPreview.overlay) { attachmentPreview.closeOverlay(); return; }
+    const p = CFG.path.replace(/\/$/, '').split('/'); p.pop();
+    navigate(p.join('/') || '/');
+}
+window.navUp = navUp;
+window.clearDemoRoot = () => {
+    if (!window.SyncBackend?.clearRoot?.()) return;
+};
+
+// Browser back / Android system back closes fullscreen first.
+window.addEventListener('popstate', () => {
+    if (attachmentPreview.overlay) {
+        attachmentPreview.closeOverlay(true);
+        return;
+    }
+    initInspect();
+    CFG.path = pathFromLocation();
+    init();
+});
+// SPA wiring for folder navigation: keep internal `?path=` links in-app unless the
+// user is explicitly opening a new tab/window.
+document.addEventListener('click', e => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest('a[href^="?"]');
+    if (!a || a.target || a.hasAttribute('download')) return;
+    const path = new URL(a.href).searchParams.get('path');
+    if (path == null) return;
+    e.preventDefault();
+    navigate(path || '/');
+});
+
+if (window.SyncBackend) {
+    // Drag-drop or picker swapped the active root — go back to / and re-render.
+    document.addEventListener('sync-root-changed', () => {
+        if (CFG.path !== '/') {
+            history.pushState(null, '', '?' + new URLSearchParams({ path: '/' }));
+            CFG.path = '/';
+        }
+        init();
+    });
+}
+
+const setHelp = open => $('help').hidden = !open;
+const toggleHelp = () => { setHelp($('help').hidden); if (!$('help').hidden) setMenu(false); };
+window.toggleHelp = toggleHelp;
+document.addEventListener('click', e => {
+    if ($('help').hidden) return;
+    if (e.target.closest('#help') || e.target.closest('#help-btn')) return;
+    setHelp(false);
+});
+
+// Header three-dot menu: edit-mode toggle + info + theme picker.
+const setMenu = open => {
+    const m = $('menu'); if (!m) return;
+    m.hidden = !open;
+    $('menu-btn')?.setAttribute('aria-expanded', String(!!open));
+};
+const toggleMenu = () => { setMenu($('menu').hidden); if (!$('menu').hidden) setHelp(false); };
+window.toggleMenu = toggleMenu;
+document.addEventListener('click', e => {
+    if ($('menu')?.hidden) return;
+    if (e.target.closest('#menu') || e.target.closest('#menu-btn')) return;
+    setMenu(false);
+});
+
+// Theme: 'auto' (default) follows OS, 'light' / 'dark' force. Persisted in localStorage.
+const THEME_KEY = 'syncplayer.theme';
+function applyTheme(theme) {
+    const t = ['auto','light','dark'].includes(theme) ? theme : 'auto';
+    if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem(THEME_KEY, t); } catch(e) {}
+    document.querySelectorAll('#theme-seg button').forEach(b => {
+        b.classList.toggle('on', b.dataset.theme === t);
+        b.setAttribute('aria-checked', String(b.dataset.theme === t));
+    });
+    invalidateWaveformPaint();
+    if (player) onPlayerChange(player);
+}
+function initTheme() {
+    let t = 'auto';
+    try { t = localStorage.getItem(THEME_KEY) || 'auto'; } catch(e) {}
+    applyTheme(t);
+}
+
+const SHOW_WF_KEY = 'syncplayer.showWaveforms';
+function applyShowWaveforms(show) {
+    document.body.classList.toggle('hide-wf', !show);
+    try { localStorage.setItem(SHOW_WF_KEY, show ? '1' : '0'); } catch(e) {}
+    const btn = $('menu-show-wf');
+    if (btn) {
+        btn.classList.toggle('on', show);
+        btn.setAttribute('aria-checked', String(show));
+    }
+    if (show) {
+        invalidateWaveformPaint();
+        if (player) onPlayerChange(player);
+    }
+}
+function initShowWaveforms() {
+    let v = '1';
+    try { v = localStorage.getItem(SHOW_WF_KEY) ?? '1'; } catch(e) {}
+    applyShowWaveforms(v !== '0');
+}
+
+// Save indicator dot in the header chip. Saved state auto-fades back to idle so
+// the chip rests at a neutral state when nothing's happening.
+let _saveIndicatorClearTimer = 0;
+function setSaveIndicator(state) {
+    const chip = $('edit-chip');
+    if (!chip) return;
+    chip.classList.remove('saving', 'saved', 'error');
+    if (state && state !== 'idle') chip.classList.add(state);
+    clearTimeout(_saveIndicatorClearTimer);
+    if (state === 'saved' || state === 'error') {
+        _saveIndicatorClearTimer = setTimeout(() => {
+            chip.classList.remove('saved', 'error');
+        }, state === 'saved' ? 1600 : 4000);
+    }
+}
+
+function setEditMode(on) {
+    const next = !!on && CFG.canWrite;
+    if (metaEditMode && !next) {
+        // Commit pending text edits: blur any focused field inside an edit zone so
+        // its onblur / change handler fires before the editors hide.
+        const el = document.activeElement;
+        if (el && (el.classList.contains('bt-input') || el.classList.contains('descr-edit'))) el.blur();
+    }
+    metaEditMode = next;
+    document.body.classList.toggle('edit-mode', metaEditMode);
+    syncDescriptionUI();
+    const btn = $('menu-edit');
+    if (btn) {
+        btn.classList.toggle('on', metaEditMode);
+        btn.setAttribute('aria-checked', String(metaEditMode));
+    }
+}
+
+function bindMenu() {
+    $('edit-chip')?.addEventListener('click', () => setEditMode(false));
+    $('menu-cloud')?.addEventListener('click', () => setMenu(false));
+    $('menu-offline')?.addEventListener('click', () => toggleCurrentPin());
+    const editBtn = $('menu-edit');
+    if (editBtn) {
+        if (!CFG.canWrite) {
+            editBtn.disabled = true;
+            editBtn.title = 'This source is read-only';
+            const info = $('menu-edit-info');
+            if (info) info.textContent = 'This source is read-only. Base tones and the description cannot be changed here.';
+        }
+        editBtn.onclick = () => CFG.canWrite && setEditMode(!metaEditMode);
+    }
+    const inspectBtn = $('menu-inspect');
+    if (inspectBtn) inspectBtn.onclick = () => setInspectEnabled(!_inspectEnabled);
+    document.querySelectorAll('#theme-seg button').forEach(b => {
+        b.onclick = () => applyTheme(b.dataset.theme);
+    });
+    const showWfBtn = $('menu-show-wf');
+    if (showWfBtn) {
+        showWfBtn.onclick = () => applyShowWaveforms(document.body.classList.contains('hide-wf'));
+    }
+    const stageBtn = $('menu-stage');
+    if (stageBtn) {
+        stageBtn.onclick = () => applyStageEnabled(!document.body.classList.contains('stage-on'));
+    }
+}
+
+// Per-track ⋮ menu — only one open at a time.
+function closeAllTrackMenus() {
+    document.querySelectorAll('.track-menu-pop').forEach(p => p.hidden = true);
+    document.querySelectorAll('.track-menu-btn').forEach(b => b.setAttribute('aria-expanded', 'false'));
+}
+function toggleTrackMenu(i) {
+    const pop = $(`tmenu-${i}`);
+    if (!pop) return;
+    const wasOpen = !pop.hidden;
+    closeAllTrackMenus();
+    if (!wasOpen) {
+        pop.hidden = false;
+        document.querySelector(`[data-track-menu="${i}"]`)?.setAttribute('aria-expanded', 'true');
+    }
+}
+document.addEventListener('click', e => {
+    if (e.target.closest('.track-menu-pop') || e.target.closest('.track-menu-btn')) return;
+    closeAllTrackMenus();
+});
+
+async function downloadTrackFile(file) {
+    if (!file) return;
+    if (window.SyncBackend?.downloadFile) {
+        try { await window.SyncBackend.downloadFile(file.path, file.name); }
+        catch (e) { setBaseToneStatus('Download failed: ' + (e?.message || e), true); }
+        return;
+    }
+    const a = document.createElement('a');
+    a.href = fileHref(file.path, true);
+    a.download = file.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+function canPreviewAttachment(file) {
+    return file?.kind === 'image' || file?.kind === 'pdf';
+}
+
+function attachmentMimeType(file) {
+    const name = (file?.name || '').toLowerCase();
+    if (name.endsWith('.avif')) return 'image/avif';
+    if (name.endsWith('.bmp')) return 'image/bmp';
+    if (name.endsWith('.gif')) return 'image/gif';
+    if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+    if (name.endsWith('.png')) return 'image/png';
+    if (name.endsWith('.svg')) return 'image/svg+xml';
+    if (name.endsWith('.webp')) return 'image/webp';
+    if (name.endsWith('.pdf')) return 'application/pdf';
+    return 'application/octet-stream';
+}
+
+function shortAttachmentName(name, max = 40) {
+    if (!name || name.length <= max) return name || '';
+    return name.slice(0, Math.max(0, max - 3)) + '...';
+}
+
+// Attachment preview has two modes:
+//   - inline: a single bordered square below the chips (no outer wrapper chrome,
+//     so it doesn't look container-in-container)
+//   - fullscreen overlay: a fixed overlay z-indexed below .master (z:40), with
+//     bottom offset to the master's height — so the transport bar stays visible
+//     and usable while reading/viewing.
+const attachmentPreview = {
+    // inline state
+    path: '',
+    url: '',
+    file: null,
+    // overlay state
+    overlay: null,
+    overlayUrl: '',
+    onKey: null,
+    masterObserver: null,
+    pushedHistory: false,
+
+    panel() { return $('attachment-inline-preview'); },
+
+    src(file, url) {
+        if (file.kind === 'pdf') return `${url}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`;
+        return url;
+    },
+
+    mediaHTML(file, url, cls) {
+        return file.kind === 'pdf'
+            ? `<object class="${cls} ${cls}-pdf" data="${escapeHtml(this.src(file, url))}" type="application/pdf">
+                <a class="attachment-inline-fallback" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Open PDF</a>
+            </object>`
+            : `<img class="${cls} ${cls}-image" src="${escapeHtml(url)}" alt="${escapeHtml(file.name)}" loading="lazy">`;
+    },
+
+    // Zoom is image-only — PDFs have their own viewer zoom. Buttons live in the
+    // stage's overlay-actions strip; the wheel handler is on the scrollable root.
+    zoomButtonsHTML(file) {
+        if (file.kind !== 'image') return '';
+        return `<button type="button" class="attachment-stage-btn" data-attachment-zoom-out title="Zoom out" aria-label="Zoom out">−</button>
+            <button type="button" class="attachment-stage-btn" data-attachment-zoom-in title="Zoom in" aria-label="Zoom in">+</button>`;
+    },
+
+    bindZoom(root, mediaSelector) {
+        const media = root.querySelector(mediaSelector);
+        if (!media) return;
+        let scale = 1;
+        const set = (v) => {
+            scale = Math.max(0.1, Math.min(8, v));
+            media.style.setProperty('--scale', String(scale));
+        };
+        root.querySelectorAll('[data-attachment-zoom-in]').forEach(b => b.addEventListener('click', () => set(scale * 1.10)));
+        root.querySelectorAll('[data-attachment-zoom-out]').forEach(b => b.addEventListener('click', () => set(scale / 1.10)));
+        root.addEventListener('wheel', (e) => {
+            if (!e.ctrlKey) return;
+            e.preventDefault();
+            set(scale * (e.deltaY < 0 ? 1.05 : 1 / 1.05));
+        }, { passive: false });
+    },
+
+    resetButtonStates() {
+        document.querySelectorAll('[data-attachment-open], [data-attachment-fullscreen]').forEach(btn => {
+            btn.classList.remove('on');
+            btn.disabled = false;
+        });
+    },
+
+    setInlineButton(i, on = false, disabled = false) {
+        const btn = document.querySelector(`[data-attachment-open="${i}"]`);
+        if (!btn) return;
+        btn.classList.toggle('on', on);
+        btn.disabled = disabled;
+    },
+
+    setFullscreenButton(i, disabled = false) {
+        const btn = document.querySelector(`[data-attachment-fullscreen="${i}"]`);
+        if (btn) btn.disabled = disabled;
+    },
+
+    clearInline() {
+        if (this.url.startsWith('blob:')) URL.revokeObjectURL(this.url);
+        this.path = '';
+        this.url = '';
+        this.file = null;
+        const panel = this.panel();
+        if (panel) {
+            panel.hidden = true;
+            panel.dataset.path = '';
+            panel.innerHTML = '';
+        }
+    },
+
+    closeOverlay(fromPopstate = false) {
+        if (!this.overlay && !this.pushedHistory) return;
+        if (this.masterObserver) { this.masterObserver.disconnect(); this.masterObserver = null; }
+        if (this.onKey) {
+            document.removeEventListener('keydown', this.onKey, true);
+            this.onKey = null;
+        }
+        if (this.overlayUrl.startsWith('blob:')) URL.revokeObjectURL(this.overlayUrl);
+        this.overlayUrl = '';
+        this.overlay?.remove();
+        this.overlay = null;
+        if (this.pushedHistory && !fromPopstate) {
+            this.pushedHistory = false;
+            history.back();
+        } else {
+            this.pushedHistory = false;
+        }
+    },
+
+    clear() {
+        this.closeOverlay();
+        this.clearInline();
+        this.resetButtonStates();
+    },
+
+    inlineHTML(file, url) {
+        return `<div class="attachment-inline-stage" id="attachment-inline-stage">
+            ${this.mediaHTML(file, url, 'attachment-inline-media')}
+            <div class="attachment-inline-overlay-actions">
+                ${this.zoomButtonsHTML(file)}
+                <button type="button" class="attachment-stage-btn" id="attachment-preview-close" title="Close" aria-label="Close preview">×</button>
+            </div>
+        </div>`;
+    },
+
+    bindPanel() {
+        $('attachment-preview-close')?.addEventListener('click', () => {
+            this.clearInline();
+            this.resetButtonStates();
+        });
+    },
+
+    updateBottomOffset() {
+        if (!this.overlay) return;
+        const master = $('master');
+        this.overlay.style.bottom = (master ? master.offsetHeight : 0) + 'px';
+    },
+
+    async openInline(file, i) {
+        if (!canPreviewAttachment(file)) return;
+        const panel = this.panel();
+        if (!panel) return;
+        if (this.path === file.path) {
+            this.clearInline();
+            this.resetButtonStates();
+            return;
+        }
+        this.clearInline();
+        this.setInlineButton(i, false, true);
+        try {
+            let bytes = await audioCacheGet(audioKey(file));
+            if (!bytes) bytes = await loadBytes(file.path);
+            const url = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+            this.path = file.path;
+            this.url = url;
+            this.file = file;
+            panel.dataset.path = file.path;
+            panel.hidden = false;
+            panel.innerHTML = this.inlineHTML(file, url);
+            this.bindPanel();
+            const stage = $('attachment-inline-stage');
+            if (stage) this.bindZoom(stage, '.attachment-inline-media-image');
+            this.setInlineButton(i, true, false);
+        } catch (e) {
+            setBaseToneStatus('Preview failed: ' + (e?.message || e), true);
+            this.setInlineButton(i, false, false);
+        }
+    },
+
+    async openOverlay(file, i) {
+        if (!canPreviewAttachment(file)) return;
+        this.setFullscreenButton(i, true);
+        try {
+            let bytes = await audioCacheGet(audioKey(file));
+            if (!bytes) bytes = await loadBytes(file.path);
+            const url = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+            this.closeOverlay();
+            this.overlayUrl = url;
+            const overlay = document.createElement('div');
+            overlay.className = 'attachment-fs-stage';
+            overlay.tabIndex = -1;
+            const zoomBtns = this.zoomButtonsHTML(file);
+            overlay.innerHTML = `<div class="attachment-fs-actions">${zoomBtns}<button type="button" class="attachment-stage-btn attachment-fs-close" aria-label="Close fullscreen" title="Close (Esc)">×</button></div>${this.mediaHTML(file, url, 'attachment-fs-media')}`;
+            this.overlay = overlay;
+            document.body.appendChild(overlay);
+            this.bindZoom(overlay, '.attachment-fs-media-image');
+            this.updateBottomOffset();
+            const master = $('master');
+            if (master && typeof ResizeObserver === 'function') {
+                this.masterObserver = new ResizeObserver(() => this.updateBottomOffset());
+                this.masterObserver.observe(master);
+            }
+            // Embedded PDF viewer auto-focuses and eats keys. Focus the overlay so
+            // Escape works at least until the user clicks into the PDF.
+            this.onKey = (e) => { if (e.key === 'Escape') { this.closeOverlay(); e.preventDefault(); } };
+            document.addEventListener('keydown', this.onKey, true);
+            overlay.querySelector('.attachment-fs-close')?.addEventListener('click', () => this.closeOverlay());
+            try {
+                history.pushState({ syncFsOverlay: true }, '');
+                this.pushedHistory = true;
+            } catch {}
+            overlay.focus({ preventScroll: true });
+        } catch (e) {
+            setBaseToneStatus('Preview failed: ' + (e?.message || e), true);
+        } finally {
+            this.setFullscreenButton(i, false);
+        }
+    },
+};
+
+async function init() {
+    setHeader();
+    if (window.SyncBackend && !window.SyncBackend.ready()) {
+        window.SyncBackend.renderPicker($('root'), () => init());
+        return;
+    }
+
+    // Capture the path the current init() round is for. If the user navigates
+    // away before the network fetch resolves, the late response is for a
+    // different folder — bail instead of overwriting the active view.
+    const myPath = CFG.path;
+    const stillCurrent = () => CFG.path === myPath;
+    inspect('init:start', { path: myPath });
+
+    if (!window.SyncBackend && !_tree) _tree = loadTreeFromLocalStorageSync();
+
+    async function renderCached(cachedList) {
+        if (!cachedList || !stillCurrent()) return false;
+        inspect('init:cached-render', () => ({
+            folders: (cachedList.folders || []).length,
+            files: (cachedList.files || []).length,
+            attachments: (cachedList.attachments || []).length,
+        }));
+        if (!treeEntry(myPath)) updateTreeEntry(myPath, cachedList).catch(() => {});
+        const cachedMeta = await listCacheGet(`load-meta::${myPath}`);
+        if (!stillCurrent()) return false;
+        resetMetaState();
+        applyMetaPayload(cachedMeta);
+        renderView(cachedList);
+        _lastRenderData = cachedList;
+        refreshPinState();
+        return true;
+    }
+
+    let renderedFromCache = await renderCached(treeEntry(myPath));
+
+    // Load slower caches in the background — they should not hold up the first paint.
+    if (!window.SyncBackend) {
+        loadPinnedPaths().then(() => {
+            if (!stillCurrent()) return;
+            rerenderFolderBadges();
+            refreshPinState();
+        }).catch(() => {});
+        loadTree().catch(() => {});
+    }
+
+    // SWR: paint cached list immediately so offline reloads (and slow networks)
+    // show the last-known content right away. Then refresh in the background.
+    // Skip for browser-fs builds — files are local, api() is the adapter's, and
+    // the IDB list cache is never populated.
+    if (!window.SyncBackend && !renderedFromCache) {
+        const cachedList = await listCacheGet(`list::${myPath}`);
+        renderedFromCache = await renderCached(cachedList);
+        if (!stillCurrent()) return;
+    }
+
+    let data;
+    try {
+        data = await api('list', myPath);
+    } catch (e) {
+        setNetworkState('offline');
+        inspect('init:list-error', { message: e?.message || String(e), renderedFromCache });
+        if (renderedFromCache) {
+            refreshPinState();
+            return;
+        }
+        renderError(e?.message || String(e));
+        return;
+    }
+    if (!stillCurrent()) return;
+    if (handleAuth(data)) return;
+    setNetworkState(data._stale ? 'offline' : 'online');
+    inspect('init:list-result', () => ({
+        stale: !!data._stale,
+        renderedFromCache,
+        folders: (data.folders || []).length,
+        files: (data.files || []).length,
+        attachments: (data.attachments || []).length,
+    }));
+    if (data.error)    { if (!renderedFromCache) renderError(data.error); return; }
+    if (data._stale) {
+        inspect('init:stale-skip', { renderedFromCache: true });
+        if (!renderedFromCache) {
+            renderView(data);
+            _lastRenderData = data;
+        }
+        refreshPinState();
+        return;
+    }
+    await updateTreeEntry(myPath, data).catch(() => {});
+    scheduleTreeRefresh(renderedFromCache ? 240 : 80);
+    if (data.files?.length || data.attachments?.length) {
+        const meta = await loadFolderMeta(myPath);
+        if (!stillCurrent()) return;
+        if (handleAuth(meta)) return;
+        if (meta.error && !renderedFromCache) { renderError(meta.error); return; }
+    } else if (!renderedFromCache) {
+        resetMetaState();
+    }
+
+    if (renderedFromCache) applyFreshData(data);
+    else { renderView(data); _lastRenderData = data; }
+    refreshPinState();
+}
+
+// Reconcile a freshly fetched list with what's on screen. Three cases:
+//   - everything matches: just refresh the meta-bound UI (description, tones).
+//   - only folders changed: patch the folder UL in place, leave the player alone.
+//     If the user is mid-search the patch is deferred — they'd lose their query.
+//   - files/attachments changed: full re-render. Skipped while the player is
+//     actively playing, since renderView destroys+recreates the SyncPlayer.
+function applyFreshData(data) {
+    const prev = _lastRenderData || { folders: [], files: [], attachments: [] };
+    const same = (x, y) => JSON.stringify(x || []) === JSON.stringify(y || []);
+    const foldersSame = same(prev.folders, data.folders);
+    const filesSame   = same(prev.files,   data.files);
+    const attachSame  = same(prev.attachments, data.attachments);
+
+    if (filesSame && attachSame && foldersSame) {
+        inspect('fresh:no-change', () => ({ folders: (data.folders || []).length, files: (data.files || []).length }));
+        syncBaseToneUI();
+        syncDescriptionUI();
+        _lastRenderData = data;
+        return;
+    }
+
+    if (filesSame && attachSame) {
+        const nextFolders = data.folders || [];
+        const hadFolders = !!(prev.folders || []).length;
+        const hasFolders = !!nextFolders.length;
+        const ul = $('folders');
+        const inp = $('ffilter');
+        if (hadFolders !== hasFolders || (!ul && hasFolders)) {
+            inspect('fresh:rerender-folders', { hadFolders, hasFolders });
+            const q = inp?.value || '';
+            const wasFocused = inp && document.activeElement === inp;
+            renderView(data);
+            _lastRenderData = data;
+            if (q) {
+                const newInp = $('ffilter');
+                if (newInp) {
+                    newInp.value = q;
+                    newInp.dispatchEvent(new Event('input'));
+                    if (wasFocused) newInp.focus();
+                }
+            }
+            return;
+        }
+        _folderState = nextFolders;
+        inspect('fresh:patch-folders', { count: nextFolders.length, searching: !!inp?.value.trim() });
+        // Don't clobber an active search — fresh _folderState is already in
+        // place; clearing the query will reveal it.
+        if (ul && (!inp || !inp.value.trim())) {
+            ul.innerHTML = renderFolderItems(_folderState);
+        }
+        _lastRenderData = data;
+        return;
+    }
+
+    if (player?.isPlay) return; // defer; IDB is already fresh, will apply on next nav
+
+    const inp = $('ffilter');
+    const q = inp?.value || '';
+    const wasFocused = inp && document.activeElement === inp;
+    inspect('fresh:rerender-full', () => ({
+        folders: (data.folders || []).length,
+        files: (data.files || []).length,
+        attachments: (data.attachments || []).length,
+    }));
+    renderView(data);
+    _lastRenderData = data;
+    if (q) {
+        const newInp = $('ffilter');
+        if (newInp) {
+            newInp.value = q;
+            newInp.dispatchEvent(new Event('input'));
+            if (wasFocused) newInp.focus();
+        }
+    }
+}
+
+function renderError(msg) { $('root').innerHTML = `<div class="err">${escapeHtml(msg)}</div>`; }
+
+// Auth-response dispatch helper. Returns true if `res` was a 401 (and renderAuth
+// was called), so the caller can early-return. Use it instead of the 2-liner.
+function handleAuth(res) {
+    if (res?._appAuth) { renderAuth({ app: true,  hint: res.hint }); return true; }
+    if (res?._auth)    { renderAuth({ app: false, hint: res.hint }); return true; }
+    return false;
+}
+
+function renderAuth({ app, hint }) {
+    const title = app ? 'Access password' : 'Share password';
+    const hintHtml = hint
+        ? `<p style="margin:0 0 16px;color:var(--mut);font-size:13px;line-height:1.45">${escapeHtml(hint)}</p>`
+        : '';
+    $('root').innerHTML = `<div class="setup"><div class="box">
+        <h3 style="margin-top:0">🔒 ${title}</h3>
+        ${hintHtml}
+        <form onsubmit="return submitPw(event, ${app ? 'true' : 'false'})">
+            <div class="grp"><input id="pwin" type="password" autofocus required></div>
+            <button class="btn btn-p">Unlock</button>
+        </form>
+    </div></div>`;
+}
+
+window.submitPw = (e, isApp) => {
+    e.preventDefault();
+    const val = $('pwin').value;
+    const key = isApp ? 'apw_' : 'spw_';
+    if (isApp) CFG.appPw = val; else CFG.pw = val;
+    try { sessionStorage.setItem(key + CFG.adapterId, val); } catch(e) {}
+    init();
+    return false;
+};
+
+// Render folders + player together. Either may be empty.
+let _folderState = [];
+// Last data passed to renderView — used by applyFreshData to diff SWR refreshes.
+let _lastRenderData = null;
+
+function renderView(data) {
+    attachmentPreview.clear();
+    _folderState = data.folders || [];
+    const files = data.files || [];
+    const attachments = data.attachments || [];
+    inspect('render', { folders: _folderState.length, files: files.length, attachments: attachments.length });
+    const foldersBlock = _folderState.length ? `
+        <div class="folders-wrap">
+            <div class="filter">
+                <div class="filter-box">
+                    <svg class="search-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+                    <input id="ffilter" type="search" placeholder="Filter folders" autocomplete="off" spellcheck="false">
+                </div>
+            </div>
+            <div class="filter-status" id="fstatus" hidden></div>
+            <ul class="folders" id="folders">${renderFolderItems(_folderState)}</ul>
+        </div>` : '';
+    const playerMarkup = (files.length || attachments.length) ? playerHTML(files, attachments) : '';
+    const empty = (!_folderState.length && !files.length && !attachments.length)
+        ? `<div class="loading">Empty folder.</div>` : '';
+
+    $('root').innerHTML = foldersBlock + playerMarkup + empty;
+    document.body.classList.toggle('has-player', !!files.length);
+    setHeader();
+    bindDescriptionEditor();
+    bindAttachmentCards(attachments);
+    if (files.length) {
+        if (player) player.destroy();
+        player = new SyncPlayer(files, onPlayerChange);
+        _trackEls = [...document.querySelectorAll('.track')];
+        _trackEls.forEach(cacheTrackElements);
+        cachePlayerUI();
+        invalidateWaveformPaint();
+        bindControls();
+        observeWaveformLayouts();
+        initStage(files);
+        player.load();
+    } else if (player) {
+        player.destroy(); player = null;
+        clearPlayerUICache();
+        disconnectWaveformObserver();
+    } else {
+        clearPlayerUICache();
+    }
+    if (_folderState.length) bindFilter();
+}
+
+// One ResizeObserver per render — fires once layout for the .wf containers
+// finishes (which in Firefox can be after the post-load _emit() ran with a
+// 0-width canvas) and on every subsequent reflow. Cheaper than a window resize
+// listener and catches more cases (font swap, container wrap, etc.).
+let _wfObserver = null;
+function disconnectWaveformObserver() {
+    _wfObserver?.disconnect();
+    _wfObserver = null;
+}
+function observeWaveformLayouts() {
+    disconnectWaveformObserver();
+    if (typeof ResizeObserver !== 'function') return;
+    _wfObserver = new ResizeObserver(() => {
+        if (!player) return;
+        invalidateWaveformPaint();
+        onPlayerChange(player);
+    });
+    document.querySelectorAll('.track .wf').forEach(el => _wfObserver.observe(el));
+}
+
+function renderFolderItems(folders) {
+    if (!folders.length) return '<li class="no-match">No matches</li>';
+    return folders.map(f => {
+        const pin = _pinnedPaths.has(f.path)
+            ? `<span class="folder-pin-badge" title="Available offline" aria-hidden="true"><svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/></svg></span>`
+            : '';
+        return `<li><a href="${dirHref(f.path)}">
+            <div class="meta"><span class="nm">${escapeHtml(f.name)}</span></div>
+            ${pin}<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        </a></li>`;
+    }).join('');
+}
+
+function rerenderFolderBadges() {
+    const ul = $('folders');
+    if (!ul) return;
+    // Don't overwrite live search results — the filter will re-render on its own.
+    const inp = $('ffilter');
+    if (inp?.value.trim()) return;
+    ul.innerHTML = renderFolderItems(_folderState);
+}
+
+
+function setFilterStatus(msg) {
+    const s = $('fstatus');
+    if (!s) return;
+    s.textContent = msg || '';
+    s.hidden = !msg;
+}
+
+function bindFilter() {
+    const inp = $('ffilter');
+    if (!inp) return;
+    inp.oninput = () => {
+        const q = inp.value.trim().toLowerCase();
+        const ul = $('folders');
+        if (!ul) return;
+        if (!q) {
+            ul.innerHTML = renderFolderItems(_folderState);
+            setFilterStatus('');
+            return;
+        }
+        // When the tree is available, search across all folders in the library;
+        // otherwise fall back to just the current level.
+        const scope = _tree
+            ? [...new Map(
+                Object.values(_tree).flatMap(e => e.folders || []).map(f => [f.path, f])
+              ).values()]
+            : _folderState;
+        const found = scope.filter(f => f.name.toLowerCase().includes(q));
+        ul.innerHTML = renderFolderItems(found);
+        setFilterStatus(found.length ? '' : 'No matches');
+    };
+    inp.focus({ preventScroll: true });
+}
+
+// Trailing punctuation that's almost always sentence punctuation, not part of the URL.
+const URL_RE = /https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]}]/g;
+function linkifyText(text) {
+    let html = '', last = 0;
+    for (const m of text.matchAll(URL_RE)) {
+        html += escapeHtml(text.slice(last, m.index));
+        const url = m[0];
+        html += `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+        last = m.index + url.length;
+    }
+    return html + escapeHtml(text.slice(last));
+}
+
+function descriptionHTML() {
+    const text = metaDescription || '';
+    // Two elements: a div renders the readonly view (so URLs become clickable links);
+    // the textarea handles edit mode. CSS swaps which one is visible.
+    return `<div class="descr-wrap">
+        <div class="descr-view" id="descr-view">${linkifyText(text)}</div>
+        <textarea class="descr-edit" id="descr-edit" rows="1" placeholder="Add a description for this folder…" maxlength="2000" readonly>${escapeHtml(text)}</textarea>
+    </div>`;
+}
+
+function attachmentSectionHTML(files) {
+    if (!files?.length) return '';
+    return `<section class="attachments-wrap" aria-label="Images and PDFs">
+        <div class="attachments-list">${files.map((file, i) => `
+            <article class="attachment-chip">
+                <div class="attachment-kind-wrap ${file.kind === 'pdf' ? 'is-pdf' : 'is-image'}" aria-hidden="true">
+                    <span class="attachment-kind">${file.kind === 'pdf' ? 'PDF' : 'IMG'}</span>
+                </div>
+                <div class="attachment-name" title="${escapeHtml(file.name)}">${escapeHtml(shortAttachmentName(file.name))}</div>
+                <div class="attachment-actions">
+                    ${canPreviewAttachment(file) ? `<button type="button" class="attachment-action attachment-action-icon" data-attachment-open="${i}" title="Preview" aria-label="Preview ${escapeHtml(file.name)}">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+                    </button>
+                    <button type="button" class="attachment-action attachment-action-icon" data-attachment-fullscreen="${i}" title="Fullscreen" aria-label="Open ${escapeHtml(file.name)} fullscreen">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true"><path d="M3 9V3h6"/><path d="M21 9V3h-6"/><path d="M3 15v6h6"/><path d="M21 15v6h-6"/></svg>
+                    </button>` : ''}
+                    <button type="button" class="attachment-action accent" data-attachment-download="${i}">Download</button>
+                </div>
+            </article>`).join('')}
+        </div>
+        <div class="attachment-inline-preview" id="attachment-inline-preview" hidden></div>
+    </section>`;
+}
+
+function bindAttachmentCards(files) {
+    if (!files?.length) return;
+    files.forEach((file, i) => {
+        document.querySelector(`[data-attachment-download="${i}"]`)?.addEventListener('click', () => downloadTrackFile(file));
+        document.querySelector(`[data-attachment-open="${i}"]`)?.addEventListener('click', () => attachmentPreview.openInline(file, i));
+        document.querySelector(`[data-attachment-fullscreen="${i}"]`)?.addEventListener('click', () => attachmentPreview.openOverlay(file, i));
+    });
+}
+
+// field-sizing:content is the modern way (Chrome 123+); JS fallback resizes
+// the textarea to fit its content on browsers that don't support it yet (Firefox).
+function autosizeTextarea(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = el.scrollHeight + 'px';
+}
+
+function bindDescriptionEditor() {
+    const descrEdit = $('descr-edit');
+    if (!descrEdit) return;
+    descrEdit.addEventListener('input', e => {
+        setFolderDescription(e.target.value);
+        if (!CSS.supports?.('field-sizing', 'content')) autosizeTextarea(e.target);
+    });
+    descrEdit.addEventListener('blur', () => flushMetaSave());
+    syncDescriptionUI();
+}
+
+function trackMenuHTML(i) {
+    const edit = CFG.canWrite ? `<button type="button" class="tmenu-edit" data-i="${i}" role="menuitem">
+                <svg viewBox="0 0 24 24"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zm17.71-10.21a1 1 0 0 0 0-1.42l-2.33-2.33a1 1 0 0 0-1.42 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+                <span>Edit</span>
+            </button>` : '';
+    return `<div class="track-menu-wrap">
+        <button type="button" class="btn track-menu-btn" data-track-menu="${i}" aria-haspopup="menu" aria-expanded="false" title="More">⋮</button>
+        <div class="track-menu-pop" id="tmenu-${i}" hidden role="menu">
+            ${edit}<button type="button" class="tmenu-download" data-i="${i}" role="menuitem">
+                <svg viewBox="0 0 24 24"><path d="M12 3v10.59l3.29-3.3 1.42 1.42L12 16.41l-4.71-4.7 1.42-1.42L12 13.59V3h0zm-7 16h14v2H5v-2z"/></svg>
+                <span>Download</span>
+            </button>
+        </div>
+    </div>`;
+}
+
+function playerHTML(files, attachments = []) {
+    // Volume sliders are visually flagged with a speaker glyph so they're not confused with progress.
+    const spkr = (tip) => `<svg class="vol-ic" viewBox="0 0 24 24"><title>${tip}</title><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>`;
+    const playerBlock = files.length ? `<div class="player">
+        <div class="tracks">${files.map((f, i) => `
+            <div class="track" data-i="${i}">
+                <div class="row">
+                    <div class="nm" title="${escapeHtml(f.name)}">${escapeHtml(f.name.replace(/\.[^.]+$/, ''))}</div>
+                    ${renderBaseToneControl(f.name)}
+                    <div class="vol-wrap">${spkr('Click: mute · Shift+Click: solo')}<input type="range" class="vol tvol" min="0" max="100" step="1" value="100" title="Track volume · Shift+Drag: set all others"></div>
+                    <span class="vol-num" aria-hidden="true">100</span>
+                    ${trackMenuHTML(i)}
+                </div>
+                <div class="wf" title="Click to seek">
+                    <canvas class="wf-base"></canvas>
+                    <div class="wf-played"><canvas class="wf-overlay"></canvas></div>
+                </div>
+            </div>`).join('')}</div>
+        ${renderStage(files)}
+    </div>
+    <div class="master" id="master">
+        <div class="seek-bar" id="seek"><i></i><b></b></div>
+        <div class="master-inner">
+            <button class="btn btn-play" id="play" disabled title="Space"><svg class="icon" viewBox="0 0 24 24" id="play-ic"><path d="M8 5v14l11-7z"/></svg></button>
+            <button class="btn" id="back5" disabled title="←"><svg class="icon" viewBox="0 0 24 24"><path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/></svg></button>
+            <button class="btn" id="fwd5" disabled title="→"><svg class="icon" viewBox="0 0 24 24"><path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/></svg></button>
+            <button class="btn" id="rep" title="Repeat (r)"><svg class="icon" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg></button>
+            <button type="button" class="btn bt-action" id="bt-cascade" hidden>cascade</button>
+            <span class="t" id="time">0:00 / 0:00</span>
+            <span class="player-tools-status" id="bt-status"></span>
+            <div class="vol-wrap master-vol">${spkr('Mute all')}<input type="range" class="vol" id="mvol" min="0" max="200" step="1" value="100" title="Master volume"><span class="vol-state" id="mvol-state" aria-hidden="true">mixed</span></div>
+        </div>
+    </div>` : '';
+    // .play-cols is display:contents by default — only becomes a flex row when
+    // the inline preview is open AND the viewport is wide enough (see CSS).
+    return `${descriptionHTML()}<div class="play-cols">${attachmentSectionHTML(attachments)}${playerBlock}</div>`;
+}
+
+function onPlayerChange(p) {
+    const ui = _ui;
+    if (!ui.seek) return; // user navigated away
+    const colors = getWaveformColors();
+    const allMuted = p.volumes.every(v => v === 0);
+    const allSameVolume = p.volumes.every(v => v === p.volumes[0]);
+    const averageVolume = p.volumes.reduce((sum, v) => sum + v, 0) / p.volumes.length;
+    const masterDisplayVolume = allSameVolume ? p.volumes[0] : averageVolume;
+    const averagePct = Math.round(averageVolume * 100);
+    const masterPct = Math.round(masterDisplayVolume * 100);
+    ui.loadFill.style.width = (p.loadedFraction * 100) + '%';
+    ui.playFill.style.width = p.duration > 0
+        ? (Math.min(1, p.currentTime / p.duration) * 100) + '%' : '0%';
+    ui.seek.classList.toggle('done', p.loadedFraction >= 1);
+    const disabled = p.loadedFraction < 1;
+    ui.play.disabled = ui.back5.disabled = ui.fwd5.disabled = disabled;
+    const timeText = `${fmt(p.currentTime)} / ${fmt(p.duration)}`;
+    if (ui.time.textContent !== timeText) ui.time.textContent = timeText;
+    ui.playIc.innerHTML = p.isPlay
+        ? '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>'
+        : '<path d="M8 5v14l11-7z"/>';
+    ui.rep.classList.toggle('on', p.repeat);
+    ui.masterWrap.classList.toggle('muted', allMuted);
+    ui.masterWrap.classList.toggle('mixed', !allMuted && !allSameVolume);
+    ui.mvol.title = allMuted
+        ? 'Master volume (all muted)'
+        : allSameVolume
+            ? 'Master volume'
+            : `Mixed track volumes - average ${averagePct}% - drag to unify`;
+    ui.mvol.setAttribute('aria-valuetext', allMuted
+        ? 'all muted'
+        : allSameVolume
+            ? `${masterPct} percent`
+            : `mixed track volumes, average ${averagePct} percent`);
+    if (document.activeElement !== ui.mvol) ui.mvol.value = masterPct;
+
+    const played01 = p.duration ? p.currentTime / p.duration : 0;
+    const fullRepaint = _wfFullRepaint;
+    _wfFullRepaint = false;
+    const wfHidden = document.body.classList.contains('hide-wf');
+    let needsRetry = false;
+    _trackEls.forEach((tr, i) => {
+        // Effective = user-set ceiling × stage spatial attenuation. The slider
+        // reads the effective so the bars on top stay in sync as the listener
+        // moves around the stage. Stage off → stageAtten[i] is 1, so unchanged.
+        const eff = p.volumes[i] * (p.stageAtten?.[i] ?? 1);
+        const pct = (eff * 100) | 0;
+        const isMuted = eff === 0;
+        tr.classList.toggle('muted', isMuted);
+        const slider = tr._tvol;
+        if (slider && document.activeElement !== slider) slider.value = pct;
+        if (tr._volNum) tr._volNum.textContent = pct;
+        if (wfHidden) return;
+        const peaks = p.peaks[i];
+        if (!peaks) return;
+        if (fullRepaint || tr._paintedPeaks !== peaks) {
+            if (paintTrackWaveform(tr, peaks, colors)) tr._paintedPeaks = peaks;
+            else needsRetry = true;
+        }
+        updateTrackProgress(tr, played01);
+    });
+    if (needsRetry) requestAnimationFrame(() => { if (player) onPlayerChange(player); });
+}
+
+function bindControls() {
+    // Blur after click so a follow-up Space press goes through the body keydown
+    // handler (single toggle) rather than re-activating the still-focused button
+    // (which would double-toggle with the body handler).
+    $('play').onclick = e => { player.toggle(); e.currentTarget.blur(); };
+    $('back5').onclick = () => player.seek(-5);
+    $('fwd5').onclick = () => player.seek(5);
+    $('rep').onclick = () => player.toggleRepeat();
+    $('seek').addEventListener('click', e => {
+        if (player.loadedFraction < 1) return;
+        const r = e.currentTarget.getBoundingClientRect();
+        player.jumpTo((e.clientX - r.left) / r.width * player.duration);
+    });
+    $('mvol').addEventListener('pointerdown', () => {
+        if (document.activeElement?.classList?.contains('tvol')) document.activeElement.blur();
+    });
+    $('mvol').oninput = e => {
+        const value = e.target.value;
+        player.setAllVolumes(value / 100);
+        document.querySelectorAll('.tvol').forEach(slider => slider.value = value);
+    };
+    $('bt-cascade')?.addEventListener('click', runCascade);
+
+    document.querySelectorAll('.track').forEach((tr, i) => {
+        const name = player.files[i].name;
+        const tvol = tr.querySelector('.tvol');
+        // Shift-drag a track slider: pull all OTHER tracks to this value; this track stays put.
+        // Hijack the gesture before the native slider grabs it — preventDefault on pointerdown stops
+        // the thumb from tracking the cursor, then we drive the others ourselves from clientX.
+        tvol.addEventListener('pointerdown', e => {
+            if (!e.shiftKey) return;
+            e.preventDefault();
+            const rect = tvol.getBoundingClientRect();
+            const sibSliders = [...document.querySelectorAll('.tvol')];
+            const apply = cx => {
+                const t = Math.max(0, Math.min(1, (cx - rect.left) / rect.width));
+                const v = t * (tvol.max / 100); // track slider max=100 → v∈[0..1]
+                // setVolume + force-sync visual: the activeElement guard in onPlayerChange
+                // skips whichever slider held focus before this shift-drag started.
+                player.volumes.forEach((_, k) => {
+                    if (k !== i) { player.setVolume(k, v); sibSliders[k].value = (v * 100) | 0; }
+                });
+            };
+            apply(e.clientX);
+            const onMove = ev => apply(ev.clientX);
+            const onUp = () => {
+                document.removeEventListener('pointermove', onMove);
+                document.removeEventListener('pointerup', onUp);
+                document.removeEventListener('pointercancel', onUp);
+            };
+            document.addEventListener('pointermove', onMove);
+            document.addEventListener('pointerup', onUp);
+            document.addEventListener('pointercancel', onUp);
+        });
+        tvol.oninput = e => player.setVolume(i, e.target.value / 100);
+        tr.querySelector('.vol-wrap .vol-ic').onclick = e => e.shiftKey ? player.soloTrack(i) : player.toggleTrackMute(i);
+        tr.querySelector('.bt-badge')?.addEventListener('click', () => playTrackTone(name));
+        tr.querySelector('.bt-down')?.addEventListener('click', () => setTrackTone(name, shiftHalftone(toneForFile(name)?.freq ?? 440, -1), true));
+        tr.querySelector('.bt-up')?.addEventListener('click', () => setTrackTone(name, shiftHalftone(toneForFile(name)?.freq ?? 440, 1), true));
+        tr.querySelector('.bt-clear')?.addEventListener('click', () => clearTrackTone(name));
+        tr.querySelector('.bt-input')?.addEventListener('change', e => {
+            const val = e.target.value.trim();
+            if (!val) { clearTrackTone(name); return; }
+            const freq = noteToFreq(val);
+            if (!Number.isFinite(freq)) {
+                e.target.value = toneForFile(name)?.note || '';
+                setBaseToneStatus(`Invalid base tone for ${name}`, true);
+                syncBaseToneUI();
+                return;
+            }
+            setTrackTone(name, freq, true);
+        });
+        tr.querySelector('.wf').onclick = e => {
+            const r = e.currentTarget.getBoundingClientRect();
+            player.jumpTo((e.clientX - r.left) / r.width * player.duration);
+        };
+        tr.querySelector(`[data-track-menu="${i}"]`)?.addEventListener('click', e => {
+            e.stopPropagation();
+            toggleTrackMenu(i);
+        });
+        tr.querySelector('.tmenu-download')?.addEventListener('click', () => {
+            closeAllTrackMenus();
+            downloadTrackFile(player.files[i]);
+        });
+        tr.querySelector('.tmenu-edit')?.addEventListener('click', () => {
+            closeAllTrackMenus();
+            setEditMode(true);
+            tr.querySelector('.bt-input')?.focus();
+        });
+    });
+    document.querySelector('.master-inner .vol-ic').onclick = () => player.toggleMute();
+
+    document.body.onkeydown = e => {
+        if (['INPUT','TEXTAREA'].includes(e.target.tagName)) return;
+        // Auto-repeat: holding a key would otherwise fire toggle/seek dozens of
+        // times per second. Ignore repeats for all shortcuts here.
+        if (e.repeat) return;
+        if (e.key === '?')          { toggleHelp(); e.preventDefault(); return; }
+        if (e.key === 'Escape')     { setHelp(false); return; }
+        if (!player) return;
+        // Space on a focused button triggers its native activation (click on
+        // keyup). If we also toggled here, the two would cancel — leaving play
+        // state unchanged. Skip Space when a button is the keydown target and
+        // let the button's onclick do the single toggle.
+        if (e.key === ' ' && e.target.tagName !== 'BUTTON') { player.toggle(); e.preventDefault(); }
+        else if (e.key === 'ArrowLeft')  { player.seek(e.shiftKey ? -10 : -5); e.preventDefault(); }
+        else if (e.key === 'ArrowRight') { player.seek(e.shiftKey ? 10 : 5);  e.preventDefault(); }
+        else if (e.key === 'm')          player.toggleMute();
+        else if (e.key === 'r')          player.toggleRepeat();
+    };
+
+    window.addEventListener('resize', () => {
+        if (!player) return;
+        invalidateWaveformPaint();
+        onPlayerChange(player);
+    });
+    syncBaseToneUI();
+}
+
+initTheme();
+initShowWaveforms();
+initStageEnabled();
+initInspect();
+bindMenu();
+init();

@@ -1,0 +1,970 @@
+/* two retrofuture moves: (1) amber accent + soft glow on interactive bits,
+   (2) mono+uppercase micro-labels on the time readout. Everything else stays plain.
+   Theming via light-dark() — follows OS by default. The menu's theme picker
+   sets `color-scheme:light` or `color-scheme:dark` on :root via data-theme. */
+:root[data-theme="light"]{color-scheme:light}
+:root[data-theme="dark"] {color-scheme:dark}
+:root {
+    color-scheme: light dark;
+    --bg:   light-dark(#f3ecdc, #0e1116);
+    --surf: light-dark(#fbf6e8, #171b24);
+    --ink:  light-dark(#15110a, #ece4d0);
+    --mut:  light-dark(#7a6f5e, #8a8674);
+    --mut-2:light-dark(#b3a888, #4a4d57);
+    --brd:  light-dark(#e5dcc4, #262a35);
+    --acc:  light-dark(#c8410a, #ffb454);             /* burnt orange ↔ amber */
+    --acc-soft: color-mix(in oklab, var(--acc) 22%, transparent);
+    --acc-glow: color-mix(in oklab, var(--acc) 45%, transparent);
+    --wave: light-dark(#cfc4a8, #2e3340);
+    --wave-played: var(--acc);
+    /* slate, not red — so it doesn't fight the amber accent */
+    --mute: light-dark(#5b6776, #8492a6);
+
+    --pd:16px; --hdr-h:52px;
+    --r-sm:6px; --r-md:10px; --r-pill:999px;
+    --font:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;
+    --font-num:ui-monospace,"SF Mono","JetBrains Mono","Menlo",monospace;
+}
+@media(min-width:700px){:root{--pd:28px;--hdr-h:60px}}
+
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0}
+[hidden]{display:none !important}
+body{
+    background:var(--bg);color:var(--ink);
+    font-family:var(--font);font-size:15px;line-height:1.45;
+    -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+
+    &.has-player{padding-bottom:calc(112px + env(safe-area-inset-bottom))}
+}
+
+/* tiny retrofuture mark: monospaced uppercase, tracked-out — applied to time + small labels */
+.mono{
+    font-family:var(--font-num);
+    font-variant-numeric:tabular-nums;
+    text-transform:uppercase;letter-spacing:.08em;
+}
+
+header{
+    position:sticky;top:0;z-index:50;
+    height:var(--hdr-h);
+    display:flex;align-items:center;gap:2px;
+    padding:0 8px;
+    background:var(--bg);
+    border-bottom:1px solid var(--brd);
+
+    @media(min-width:700px){padding:0 calc(var(--pd) - 8px)}
+
+    & .title-wrap{
+        flex:1;min-width:0;
+        display:flex;align-items:center;gap:10px;
+        padding:0 6px;
+    }
+
+    & .title{
+        flex:1;
+        font-size:16px;font-weight:600;letter-spacing:-0.015em;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+
+        @media(min-width:700px){font-size:17px}
+    }
+}
+
+.net-ind{
+    flex:none;
+    display:inline-flex;align-items:center;gap:6px;
+    padding:4px 8px;
+    border-radius:999px;
+    border:1px solid color-mix(in oklab, var(--ink) 10%, transparent);
+    color:var(--mut);
+    background:color-mix(in oklab, var(--bg) 80%, var(--ink) 2%);
+    font:500 11px/1 var(--font-num);
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    white-space:nowrap;
+
+    &::before{
+        content:'';
+        width:7px;height:7px;border-radius:50%;
+        background:var(--mute);
+        box-shadow:0 0 0 1px color-mix(in oklab, var(--bg) 80%, transparent);
+    }
+}
+
+@media(max-width:699px){
+    .net-ind{padding:0;border:0;background:transparent}
+    .net-ind .lbl{display:none}
+}
+
+.btn{
+    cursor:pointer;background:transparent;color:var(--ink);
+    border:0;padding:8px;border-radius:var(--r-sm);
+    display:inline-flex;align-items:center;justify-content:center;
+    text-decoration:none;
+    transition:background .15s,transform .12s,opacity .15s,color .15s;
+    min-width:40px;min-height:40px;
+
+    &:hover{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+    &:active{background:color-mix(in oklab, var(--ink) 12%, transparent);transform:scale(.96)}
+    &:disabled{opacity:.28;cursor:default}
+    &:disabled:hover{background:transparent}
+    &:disabled:active{transform:none}
+
+    &.on{color:var(--acc)}
+}
+.icon{width:20px;height:20px;fill:currentColor}
+
+.folders-wrap{max-width:720px;margin:0 auto}
+.filter{
+    position:sticky;top:var(--hdr-h);z-index:30;
+    background:var(--bg);
+    padding:14px var(--pd) 12px;
+
+    @media(min-width:700px){padding:22px var(--pd) 14px}
+
+    & .filter-box{
+        max-width:720px;margin:0 auto;
+        display:flex;align-items:center;gap:10px;
+        height:42px;padding:0 14px;
+        background:var(--surf);
+        border:1px solid var(--brd);
+        border-radius:var(--r-md);
+        transition:border-color .15s,box-shadow .15s;
+
+        &:focus-within{border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft)}
+
+        & .search-ic{width:16px;height:16px;flex:none;color:var(--mut-2)}
+        & input{
+            flex:1;border:0;background:transparent;font:inherit;color:var(--ink);
+            outline:none;height:100%;padding:0;min-width:0;
+
+            &::placeholder{color:var(--mut-2)}
+            &::-webkit-search-cancel-button{
+                -webkit-appearance:none;appearance:none;
+                width:14px;height:14px;cursor:pointer;
+                background:currentColor;color:var(--mut-2);
+                mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M12 2a10 10 0 100 20 10 10 0 000-20zm4.3 13.3l-1 1-3.3-3.3-3.3 3.3-1-1 3.3-3.3-3.3-3.3 1-1 3.3 3.3 3.3-3.3 1 1L13 12z'/></svg>") center/14px no-repeat;
+            }
+        }
+    }
+}
+.filter-status{
+    max-width:720px;margin:0 auto;
+    font-size:11px;color:var(--mut);
+    padding:8px var(--pd) 0;
+    font-family:var(--font-num);text-transform:uppercase;letter-spacing:.08em;
+}
+
+.folders{
+    list-style:none;margin:0;padding:6px var(--pd) 32px;
+
+    & li a{
+        display:flex;align-items:center;gap:14px;
+        padding:14px 6px 14px 4px;
+        color:var(--ink);text-decoration:none;
+        border-bottom:1px solid var(--brd);
+        transition:background .15s;
+
+        &:hover{background:color-mix(in oklab, var(--ink) 3%, transparent)}
+        &:active{background:color-mix(in oklab, var(--ink) 6%, transparent)}
+        &:hover .chev{transform:translateX(3px);color:var(--acc)}
+    }
+    & .meta{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+    & .nm{
+        font-size:16px;font-weight:500;letter-spacing:-0.01em;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    }
+    & .pth{
+        font-size:12.5px;color:var(--mut);
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        font-feature-settings:"tnum";
+    }
+    & .chev{
+        width:16px;height:16px;flex:none;color:var(--mut-2);
+        transition:transform .2s ease,color .15s;
+    }
+}
+.no-match{padding:32px 6px;color:var(--mut);text-align:center;font-size:14px;list-style:none}
+.folder-pin-badge{display:inline-flex;align-items:center;flex:none;color:var(--acc);opacity:.7}
+
+.player{
+    padding:16px var(--pd) 24px;max-width:880px;margin:0 auto;
+    @media(min-width:700px){padding-top:28px}
+}
+.player-tools-status{
+    min-height:20px;font-size:11px;color:var(--mut);
+    font-family:var(--font-num);text-transform:uppercase;letter-spacing:.08em;
+    white-space:nowrap;
+}
+.player-tools-status.error{color:var(--acc)}
+.bt-action{
+    min-width:auto;min-height:28px;padding:4px 10px;
+    border:1px solid var(--brd);border-radius:var(--r-pill);
+    font-family:var(--font-num);font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+}
+.tracks{display:flex;flex-direction:column}
+.track{
+    padding:16px 0;border-bottom:1px solid var(--brd);transition:opacity .2s;
+
+    &:last-child{border-bottom:0}
+    &.muted{opacity:.58}
+    &.muted .nm{color:var(--mut)}
+    &.muted .wf{opacity:.58}
+
+    & .row{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+    & .nm{
+        flex:1;font-size:15px;font-weight:500;letter-spacing:-0.005em;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    }
+    & .vol-wrap{width:130px;flex:none}
+    & .vol-num{
+        flex:none;width:28px;min-width:28px;
+        color:var(--mut);font:500 11px var(--font-num, monospace);
+        font-variant-numeric:tabular-nums;text-align:right;
+        user-select:none; display:none;
+    }
+    & .wf{
+        position:relative;height:56px;border-radius:3px;
+        cursor:pointer;background:transparent;
+
+        & canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+        & .wf-played{
+            --played: 0%;
+            position:absolute;inset:0;overflow:hidden;pointer-events:none;
+            clip-path:inset(0 calc(100% - var(--played)) 0 0);
+        }
+    }
+    @media(min-width:700px){
+        & .vol-wrap{width:180px}
+        & .wf{height:64px}
+    }
+}
+body.hide-wf .track .wf{display:none}
+
+/* Stage — spatial mix view. Hidden by default; revealed when body.stage-on. */
+.stage{display:none;margin:8px 0 24px}
+body.stage-on .stage{display:block}
+.stage-head{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.stage-hint{flex:1;min-width:200px;color:var(--mut);font-size:12px;line-height:1.45}
+.stage-reset{
+    min-width:auto;min-height:28px;padding:4px 12px;
+    border:1px solid var(--brd);border-radius:var(--r-pill);
+    font-family:var(--font-num);font-size:11px;
+    text-transform:uppercase;letter-spacing:.08em;
+}
+.stage-canvas{
+    width:100%;max-width:640px;aspect-ratio:1/1;margin:0 auto;
+    border:1px solid var(--brd);border-radius:8px;
+    background:color-mix(in oklab, var(--card) 92%, transparent);
+    /* touch-action:none keeps a finger-drag from scrolling the page — the canvas
+       is a contained interactive area; users scroll past it via the margins. */
+    touch-action:none;user-select:none;overflow:hidden;
+}
+.stage-canvas svg{width:100%;height:100%;display:block}
+.stage-track{cursor:grab}
+.stage-track:active{cursor:grabbing}
+/* The audibility ring is the only per-track decoration — falloff inside is
+   implicit (dot opacity = current volume). Pointer-transparent so dragging
+   through the ring grabs the track dot underneath. */
+/* Filled audibility disc — overlapping discs show "where >1 track is audible".
+   Stroke kept very subtle for edge-definition without competing with the fills. */
+.stage-track-outer{
+    fill:color-mix(in oklab, var(--acc) 7%, transparent);
+    stroke:color-mix(in oklab, var(--acc) 14%, transparent);
+    stroke-width:.2;
+    pointer-events:none;
+}
+/* Dot fades with current spatial volume — a faint visual readout of audibility. */
+.stage-track-dot{
+    fill:var(--acc);
+    opacity:calc(.35 + var(--stage-vol, 1) * .65);
+}
+.stage-track-label{
+    fill:var(--ink);
+    font:600 2px var(--font-num, system-ui);
+    letter-spacing:.04em;text-transform:uppercase;
+    paint-order:stroke;stroke:var(--surf);stroke-width:.4;
+    pointer-events:none;
+}
+.stage-listener{cursor:grab}
+.stage-listener:active{cursor:grabbing}
+.stage-listener-halo{fill:color-mix(in oklab, var(--acc) 18%, transparent)}
+.stage-listener-dot{fill:var(--acc);stroke:var(--surf);stroke-width:.3}
+.bt-wrap{display:flex;align-items:center;gap:6px;flex:none}
+.bt-badge{
+    min-width:58px;min-height:30px;padding:6px 10px;
+    border:1px solid var(--brd);border-radius:var(--r-pill);
+    font-family:var(--font-num);font-size:12px;font-weight:600;
+    letter-spacing:.05em;
+}
+.bt-edit{display:none;align-items:center;gap:6px}
+body.edit-mode .bt-wrap.can-edit .bt-edit{display:flex}
+/* In edit mode the input carries the note — hide the badge so it isn't shown twice. */
+body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
+.bt-step{
+    min-width:30px;min-height:30px;padding:0;
+    border:1px solid var(--brd);border-radius:50%;
+    font-size:14px;
+}
+.bt-clear{
+    min-width:auto;min-height:28px;padding:0 8px;
+    border:1px solid var(--brd);border-radius:var(--r-pill);
+    font-family:var(--font-num);font-size:10px;text-transform:uppercase;letter-spacing:.08em;
+}
+.bt-input{
+    width:88px;height:32px;padding:0 10px;
+    border:1px solid var(--brd);border-radius:var(--r-pill);
+    background:var(--surf);color:var(--ink);
+    font:600 12px var(--font-num);letter-spacing:.04em;
+    text-transform:uppercase;text-align:center;outline:none;
+    transition:border-color .15s,box-shadow .15s;
+}
+.bt-input:focus{border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft)}
+
+/* transport — fixed bottom bar */
+.master{
+    position:fixed;left:0;right:0;bottom:0;z-index:40;
+    background:var(--surf);
+    border-top:1px solid var(--brd);
+    padding:16px var(--pd) calc(12px + env(safe-area-inset-bottom));
+
+    /* Dual-purpose bar along the top edge: load progress while decoding, playback
+       position once ready. Click anywhere on it to seek.
+       Visual rail is 2px; hit area is 24px total — 12px above + the 2px rail +
+       10px below — so the strip just above the master bar is also clickable. */
+    & .seek-bar{
+        position:absolute;left:0;right:0;top:-12px;
+        height:24px;overflow:hidden;
+        /* rail only at the 12-14px band — rest transparent (hit area only) */
+        background:linear-gradient(to bottom,
+            transparent 12px,
+            color-mix(in oklab, var(--acc) 14%, transparent) 12px,
+            color-mix(in oklab, var(--acc) 14%, transparent) 14px,
+            transparent 14px);
+        cursor:pointer;
+
+        /* load fill — fades after all tracks decode */
+        & > i{
+            position:absolute;top:12px;left:0;height:2px;width:0;
+            background:color-mix(in oklab, var(--acc) 55%, transparent);
+            transition:width .2s ease;
+            pointer-events:none;
+        }
+        /* playback position fill */
+        & > b{
+            position:absolute;top:12px;left:0;height:2px;width:0;
+            background:var(--acc);
+            pointer-events:none;
+        }
+        &.done > i{opacity:0;transition:opacity .25s ease .15s}
+    }
+    & .master-inner{
+        max-width:880px;margin:0 auto;
+        display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+
+        /* retrofuture: amber CRT-style readout */
+        & .t{
+            font-family:var(--font-num);font-variant-numeric:tabular-nums;
+            font-size:12px;letter-spacing:.06em;
+            color:var(--acc);
+            white-space:nowrap;padding:0 6px;
+        }
+        & .player-tools-status{
+            flex:0 0 auto;
+            min-height:0;
+            margin-left:auto;
+        }
+        & .vol-wrap{
+            flex:1 1 220px;min-width:180px;max-width:240px;
+            margin-left:auto;
+        }
+        & .master-vol{position:relative}
+        & .master-vol .vol-state{
+            position:absolute;
+            right:8px;
+            top:50%;
+            transform:translateY(-50%);
+            padding:3px 8px 4px;
+            border-radius:var(--r-pill);
+            background:color-mix(in oklab, var(--bg) 50%, transparent);
+            backdrop-filter:blur(4px);
+            font-size:11px;line-height:1;
+            text-transform:uppercase;letter-spacing:.08em;
+            color:var(--acc);
+            pointer-events:none;
+            opacity:0;
+            transition:opacity .15s ease;
+        }
+        & .master-vol.mixed .vol-state{opacity:1}
+    }
+}
+
+@media (max-width: 720px) {
+    .track .row{
+        align-items:center;
+        justify-content:space-between;
+        row-gap:8px;
+    }
+    .track .row .nm{
+        flex:1 1 auto;
+        min-width:0;
+        white-space:nowrap;
+    }
+    .track .row .vol-wrap{
+        flex:0 0 164px;
+        width:164px;
+        margin-bottom:0;
+        margin-left:auto;
+    }
+    .track .row .bt-wrap{
+        flex:0 1 auto;
+        justify-content:flex-start;
+        flex-wrap:wrap;
+        margin-left:0;
+    }
+    .master .master-inner .player-tools-status{
+        order: 2;
+        flex: 1 0 100%;
+        margin-left: 0;
+        text-align: left;
+    }
+    .master .master-inner .vol-wrap{
+        order: 1;
+        flex: 0 0 196px;
+        max-width: 196px;
+        margin-left: auto;
+        margin-bottom: 0;
+    }
+    .master .master-inner{
+        justify-content: space-between;
+    }
+}
+
+/* the one "wow": amber play button with a soft glow halo.
+   Faint horizontal scanlines layered on top of the amber face — CRT screen surface. */
+.btn-play{
+    background:var(--acc);
+    color:var(--bg);
+    width:46px;height:46px;min-width:46px;min-height:46px;
+    border-radius:23px;
+    box-shadow:0 0 0 1px var(--acc-glow), 0 0 24px -2px var(--acc-glow);
+    transition:background .15s,box-shadow .2s,transform .12s;
+
+    /* Hover gated to real pointers so taps on touch don't leave the button
+       stuck in the "lit" state until something else gets focus.
+       Background is re-set explicitly so the generic .btn:hover overlay
+       (--ink 6%) doesn't dirty the amber. */
+    @media (hover:hover){
+        &:enabled:hover{
+            background:color-mix(in oklab, var(--acc) 88%, white);
+            box-shadow:0 0 0 1px var(--acc-glow), 0 0 32px 0 var(--acc-glow);
+        }
+    }
+    &:active{background:var(--acc);transform:scale(.96);box-shadow:0 0 0 1px var(--acc-glow), 0 0 12px -2px var(--acc-glow)}
+    &:disabled{
+        background:var(--surf);color:var(--mut-2);opacity:1;
+        box-shadow:inset 0 0 0 1px var(--brd);
+    }
+    &:disabled:active{transform:none}
+}
+
+/* volume groove */
+.vol-wrap{
+    display:inline-flex;align-items:center;gap:8px;
+    background:color-mix(in oklab, var(--ink) 8%, transparent);
+    border-radius:var(--r-pill);
+    padding:0 0 0 12px;height:30px;
+    overflow:hidden;
+    flex:1;min-width:100px;
+    transition:background .15s, box-shadow .15s, opacity .15s;
+
+    & .vol-ic{
+        width:15px;height:15px;fill:var(--mut-2);flex:none;
+        cursor:pointer;transition:fill .15s;
+
+        &:hover{fill:var(--ink)}
+    }
+    &.muted{
+        background:color-mix(in oklab, var(--mute) 22%, transparent);
+        box-shadow:inset 0 0 0 1px color-mix(in oklab, var(--mute) 48%, var(--brd));
+    }
+    &.mixed{
+        background:color-mix(in oklab, var(--acc) 14%, transparent);
+        box-shadow:inset 0 0 0 1px color-mix(in oklab, var(--acc) 38%, var(--brd));
+    }
+    &.muted .vol-ic{fill:var(--mute)}
+    &.mixed .vol-ic{fill:var(--acc)}
+    &.muted .vol{opacity:.42}
+    &.mixed .vol{opacity:.72}
+    & .vol{flex:1;height:30px;background:transparent;border-radius:0}
+}
+.track.muted .vol-wrap{
+    background:color-mix(in oklab, var(--mute) 20%, transparent);
+    box-shadow:inset 0 0 0 1px color-mix(in oklab, var(--mute) 42%, var(--brd));
+}
+.track.muted .vol-ic{fill:var(--mute)}
+.track.muted .vol{opacity:.38}
+
+/* sliders — overflow-hidden + giant thumb box-shadow paints the fill (chor-player trick).
+   Thumb shadow uses --acc so the fill picks up the amber glow naturally. */
+input[type=range]{
+    -webkit-appearance:none;appearance:none;
+    background:transparent;
+    margin:0;width:100%;height:30px;
+    overflow:hidden;border-radius:var(--r-pill);cursor:pointer;
+
+    &:focus{outline:none}
+    &::-webkit-slider-thumb{
+        -webkit-appearance:none;width:0;height:30px;
+        box-shadow:-20rem 0 0 20rem var(--acc);
+    }
+    &::-moz-range-thumb{
+        width:0;height:30px;border:0;
+        box-shadow:-20rem 0 0 20rem var(--acc);
+    }
+}
+
+.loading{
+    padding:40px var(--pd);text-align:center;color:var(--mut);font-size:11px;
+    font-family:var(--font-num);text-transform:uppercase;letter-spacing:.15em;
+}
+.err{
+    max-width:720px;margin:var(--pd) auto;
+    padding:14px 16px;
+    background:color-mix(in oklab, var(--mute) 14%, var(--surf));
+    border:1px solid color-mix(in oklab, var(--mute) 35%, var(--brd));
+    border-radius:var(--r-md);color:var(--mute);font-size:14px;
+}
+
+.setup{display:flex;align-items:center;justify-content:center;min-height:80vh;padding:20px}
+.box{
+    background:var(--surf);
+    border:1px solid var(--brd);
+    padding:28px;border-radius:14px;width:100%;max-width:360px;
+
+    & h3{margin:0 0 18px;font-size:18px;font-weight:600;letter-spacing:-0.01em}
+}
+.grp{
+    margin-bottom:14px;
+
+    & input{
+        width:100%;background:var(--bg);border:1px solid var(--brd);
+        color:var(--ink);padding:12px 14px;border-radius:var(--r-md);
+        font:inherit;outline:none;
+        transition:border-color .15s,box-shadow .15s;
+
+        &:focus{border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft)}
+    }
+}
+.btn-p{
+    background:var(--acc);color:var(--bg);
+    width:100%;padding:13px;
+    font-weight:600;justify-content:center;
+    border-radius:var(--r-md);font-size:14px;
+    text-transform:uppercase;letter-spacing:.08em;
+    box-shadow:0 0 0 1px var(--acc-glow), 0 0 20px -4px var(--acc-glow);
+    transition:box-shadow .2s,transform .12s,background .15s;
+
+    &:hover{background:color-mix(in oklab, var(--acc) 90%, white);box-shadow:0 0 0 1px var(--acc-glow), 0 0 28px -2px var(--acc-glow)}
+    &:active{transform:scale(.99)}
+}
+
+.help-pop{
+    position:fixed;top:calc(var(--hdr-h) + 6px);right:var(--pd);z-index:60;
+    background:var(--surf);
+    border:1px solid var(--brd);
+    border-radius:12px;padding:16px 18px;min-width:280px;
+    box-shadow:0 12px 32px -12px color-mix(in oklab, var(--ink) 30%, transparent);
+
+    &[hidden]{display:none}
+    & h4{
+        margin:0 0 12px;font-size:11px;font-weight:600;
+        font-family:var(--font-num);text-transform:uppercase;letter-spacing:.1em;
+        color:var(--acc);
+    }
+    & dl{display:grid;grid-template-columns:auto 1fr;gap:9px 14px;margin:0;font-size:13px}
+    & dt{color:var(--mut);white-space:nowrap}
+    & dd{margin:0}
+    & kbd{
+        background:var(--bg);border:1px solid var(--brd);
+        border-radius:4px;padding:1px 6px;
+        font-family:var(--font-num);font-size:11px;
+    }
+    & .hint{
+        margin:14px 0 0;font-size:12px;color:var(--mut);
+        border-top:1px solid var(--brd);padding-top:11px;line-height:1.55;
+    }
+}
+
+/* Header edit-mode chip — visible while body.edit-mode. The whole chip exits
+   edit mode on click; the dot indicates save state (idle / saving / saved / error).
+   Dot color changes don't shift layout. */
+.edit-chip{
+    display:none;align-items:center;gap:8px;
+    height:30px;padding:0 6px 0 10px;margin:0 4px;
+    border:1px solid var(--acc);
+    border-radius:999px;
+    background:color-mix(in oklab, var(--acc) 12%, transparent);
+    color:var(--acc);
+    font-family:var(--font-num);font-size:10px;
+    text-transform:uppercase;letter-spacing:.1em;
+    cursor:pointer;
+    transition:background-color .15s, transform .12s;
+
+    & svg{width:13px;height:13px;flex:none}
+    &:hover{background:color-mix(in oklab, var(--acc) 20%, transparent)}
+    &:active{transform:scale(.96)}
+}
+body.edit-mode .edit-chip{display:inline-flex}
+.edit-chip-dot{
+    width:6px;height:6px;border-radius:50%;
+    background:color-mix(in oklab, var(--acc) 50%, transparent);
+    transition:background-color .25s, opacity .25s;
+    flex:none;
+}
+@keyframes edit-chip-pulse{
+    0%,100%{opacity:1}
+    50%{opacity:.35}
+}
+.edit-chip.saving .edit-chip-dot{
+    background:var(--acc);
+    animation:edit-chip-pulse 1s ease-in-out infinite;
+}
+.edit-chip.saved .edit-chip-dot{
+    background:light-dark(#2a9d4a, #6ad080);
+}
+.edit-chip.error .edit-chip-dot{
+    background:light-dark(#c8410a, #ff6a4d);
+}
+
+/* Header menu — same retrofuture surface as .help-pop, but with rows of actions. */
+.menu-pop{
+    position:fixed;top:calc(var(--hdr-h) + 6px);right:var(--pd);z-index:60;
+    background:var(--surf);
+    border:1px solid var(--brd);
+    border-radius:12px;padding:6px;min-width:260px;max-width:320px;
+    box-shadow:0 12px 32px -12px color-mix(in oklab, var(--ink) 30%, transparent);
+
+    &[hidden]{display:none}
+    & .row{
+        display:flex;align-items:center;gap:10px;
+        padding:9px 10px;border-radius:8px;
+        font-size:13px;color:var(--ink);text-decoration:none;
+        background:transparent;border:0;width:100%;text-align:left;
+        cursor:pointer;
+    }
+    & .row:hover:not(:disabled){background:color-mix(in oklab, var(--ink) 6%, transparent)}
+    & .row:disabled{opacity:.5;cursor:default}
+    & .row[hidden]{display:none}
+    & .row .lbl{flex:1;min-width:0}
+    & .row svg{width:15px;height:15px;flex:none;color:var(--mut)}
+    /* Toggle switch on the right of a .row — the whole row is clickable. */
+    & .switch{
+        flex:none;width:32px;height:18px;border-radius:999px;
+        background:color-mix(in oklab, var(--mut) 50%, transparent);
+        position:relative;transition:background .15s;
+    }
+    & .switch::after{
+        content:'';position:absolute;top:2px;left:2px;
+        width:14px;height:14px;border-radius:50%;
+        background:var(--bg);transition:transform .15s, background .15s;
+    }
+    & .row.on .switch{background:var(--acc)}
+    & .row.on .switch::after{transform:translateX(14px)}
+    & .seg{display:flex;gap:4px;padding:6px 10px 8px}
+    & .seg button{
+        flex:1;padding:6px 0;font-size:11px;
+        font-family:var(--font-num);text-transform:uppercase;letter-spacing:.08em;
+        background:transparent;color:var(--mut);
+        border:1px solid var(--brd);border-radius:6px;cursor:pointer;
+    }
+    & .seg button.on{background:var(--acc);color:var(--bg);border-color:var(--acc)}
+    & .seg-lbl{
+        padding:8px 10px 2px;
+        font-size:11px;font-family:var(--font-num);text-transform:uppercase;letter-spacing:.1em;
+        color:var(--mut);
+    }
+    /* Inline hint under the toggle — plain text, not a box. */
+    & .info{
+        margin:0 10px 6px;padding:0;background:transparent;border:0;
+        font-size:11.5px;color:var(--mut);line-height:1.5;
+    }
+    & hr{border:0;border-top:1px solid var(--brd);margin:4px 0}
+}
+
+/* Folder description block — single textarea, readonly outside edit mode so
+   the box size matches in both states (no layout jump on toggle). */
+.descr-wrap{
+    max-width:880px;margin:0 auto;
+    padding:14px var(--pd) 0;
+}
+.attachments-wrap{
+    max-width:880px;margin:0 auto;
+    padding:14px var(--pd) 0;
+}
+/* Wide-desktop side-by-side: attachments + preview on the left, player on the
+   right. display:contents keeps the wrapper invisible to layout in the default
+   stacked mode; :has() upgrades it to a flex row only when the inline preview
+   is actually open. */
+.play-cols{display:contents}
+@media(min-width:1100px){
+    .play-cols:has(.attachment-inline-preview:not([hidden])){
+        display:flex;align-items:flex-start;gap:24px;
+        max-width:none;margin:0;padding:0 var(--pd);
+    }
+    .play-cols:has(.attachment-inline-preview:not([hidden])) > .attachments-wrap,
+    .play-cols:has(.attachment-inline-preview:not([hidden])) > .player{
+        flex:1 1 0;min-width:0;
+        max-width:none;margin:0;padding-left:0;padding-right:0;
+    }
+}
+.attachments-list{
+    display:flex;
+    flex-wrap:wrap;
+    align-items:flex-start;
+    gap:8px;
+}
+.attachment-chip{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    width:fit-content;
+    max-width:100%;
+    min-height:34px;
+    padding:5px 6px 5px 5px;
+    background:var(--surf);
+    border:1px solid var(--brd);
+    border-radius:999px;
+}
+.attachment-kind-wrap{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    min-width:44px;
+    height:24px;
+    padding:0 8px;
+    border-radius:999px;
+    background:color-mix(in oklab, var(--card) 92%, var(--ink) 8%);
+}
+.attachment-kind-wrap.is-pdf{
+    background:linear-gradient(180deg, color-mix(in oklab, var(--card) 88%, white 12%), color-mix(in oklab, var(--card) 96%, var(--ink) 4%));
+}
+.attachment-kind{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    font:700 11px var(--font-num);
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--ink);
+}
+.attachment-actions{
+    display:flex;
+    gap:8px;
+    flex-wrap:nowrap;
+}
+.attachment-action{
+    flex:none;
+    min-height:24px;
+    padding:0 8px;
+    border:1px solid var(--brd);
+    border-radius:999px;
+    background:transparent;
+    color:var(--ink);
+    font:600 11.5px var(--font);
+    cursor:pointer;
+}
+.attachment-action.on{
+    border-color:var(--acc);
+    color:var(--acc);
+    background:var(--acc-soft);
+}
+.attachment-action:hover{
+    border-color:var(--acc);
+    color:var(--acc);
+}
+.attachment-action.accent{
+    border-color:color-mix(in oklab, var(--acc) 40%, var(--brd));
+    color:var(--acc);
+}
+.attachment-action.accent:hover{
+    border-color:var(--acc);
+    color:var(--ink);
+    background:var(--acc-soft);
+}
+.attachment-action-icon{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    min-width:24px;
+    width:24px;
+    padding:0;
+}
+.attachment-name{
+    min-width:0;
+    max-width:min(30ch, calc(100vw - 210px));
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+    font:12.5px var(--font);
+    color:var(--ink);
+}
+/* Inline square preview: the square has its own border; the .attachment-inline-preview
+   wrapper is just a positioning container (no border/background) so the square isn't
+   visually nested in another panel. */
+.attachment-inline-preview{margin-top:10px}
+.attachment-inline-preview[hidden]{display:none}
+/* aspect-ratio:1 gives the initial square; resize:vertical lets the user drag
+   the bottom-right corner to grow the panel — once they do, the inline height
+   wins over aspect-ratio. */
+.attachment-inline-stage{
+    position:relative;
+    width:100%;
+    aspect-ratio:1;
+    min-height:200px;
+    overflow:auto;
+    resize:vertical;
+    border:1px solid var(--brd);
+    border-radius:var(--r-md);
+    background:color-mix(in oklab, var(--card) 94%, var(--ink) 6%);
+}
+.attachment-inline-media{
+    display:block;
+    border:0;
+    margin:0 auto;
+}
+.attachment-inline-media-image{
+    /* --scale=1 fits container width; +/- buttons & ctrl-wheel adjust it */
+    width:calc(100% * var(--scale, 1));
+    height:auto;
+    background:color-mix(in oklab, var(--card) 94%, var(--ink) 6%);
+}
+.attachment-inline-media-pdf{
+    width:100%;
+    height:100%;
+    background:#fff;
+}
+.attachment-inline-fallback{
+    display:grid;place-items:center;
+    width:100%;height:100%;
+    color:var(--acc);text-decoration:none;
+    font:600 13px var(--font);
+}
+.attachment-inline-overlay-actions{
+    position:absolute;top:8px;right:8px;
+    display:flex;gap:6px;
+    z-index:1;
+}
+.attachment-stage-btn{
+    display:inline-flex;align-items:center;justify-content:center;
+    width:30px;height:30px;
+    padding:0;
+    border-radius:999px;
+    border:1px solid color-mix(in oklab, #fff 30%, transparent);
+    background:color-mix(in oklab, #000 55%, transparent);
+    color:#fff;font:600 18px/1 var(--font);
+    cursor:pointer;
+    transition:border-color .15s, background-color .15s;
+}
+.attachment-stage-btn:hover{
+    border-color:#fff;
+    background:color-mix(in oklab, #000 75%, transparent);
+}
+
+/* Fullscreen overlay: fixed below .master (z:40), with bottom offset set by JS to
+   the master's height so the transport bar stays visible/usable while previewing. */
+.attachment-fs-stage{
+    /* top:var(--hdr-h) keeps the page header visible above the overlay; the
+       bottom offset is set by JS to the master's height so the transport bar
+       stays usable too. */
+    position:fixed;top:var(--hdr-h);left:0;right:0;bottom:0;
+    overflow:auto;
+    background:#111;
+    z-index:35;
+}
+.attachment-fs-actions{
+    /* fixed (not absolute): stays in the viewport corner even when the stage scrolls */
+    position:fixed;top:calc(var(--hdr-h) + 12px);right:12px;
+    display:flex;gap:6px;
+    z-index:36;
+}
+.attachment-fs-close{
+    width:36px;height:36px;font-size:20px;
+}
+.attachment-fs-media{
+    display:block;
+    border:0;
+}
+.attachment-fs-media-image{
+    /* --scale=1 fits viewport width; +/- buttons & ctrl-wheel adjust it.
+       Tall/zoomed images scroll inside the stage. */
+    width:calc(100% * var(--scale, 1));
+    height:auto;
+    margin:0 auto;
+    background:#111;
+}
+.attachment-fs-media-pdf{
+    width:100%;
+    height:100%;
+    background:#fff;
+}
+.descr-edit, .descr-view{
+    display:block;width:calc(100% + 20px);
+    background:transparent;color:var(--mut);
+    border:1px solid transparent;border-radius:var(--r-md);
+    /* Negative side-margin + matching padding: the text content aligns with the
+       track name on the left, while the border/focus ring still has 10px of
+       breathing room on each side. */
+    padding:6px 10px;margin:0 -10px;
+    font:13.5px var(--font);line-height:1.55;
+}
+.descr-edit{
+    resize:none;overflow:hidden;outline:none;
+    field-sizing:content;min-height:calc(1.55em + 12px);
+    transition:border-color .15s, background-color .15s, color .15s, box-shadow .15s;
+}
+.descr-edit::placeholder{color:var(--mut-2);font-style:italic}
+.descr-edit[readonly]{cursor:default;white-space:pre-wrap}
+.descr-view{white-space:pre-wrap;word-wrap:break-word}
+.descr-view a{color:var(--acc);text-decoration:underline}
+.descr-view a:hover{text-decoration:none}
+/* Show the linkified view when readonly; show the textarea when editable. */
+.descr-edit[readonly]{display:none}
+.descr-wrap:has(.descr-edit:not([readonly])) .descr-view{display:none}
+/* Empty + readonly → no point showing an empty box, hide the whole thing. */
+.descr-wrap:has(.descr-edit[readonly]):not(:has(.descr-view:not(:empty))){display:none}
+body.edit-mode .descr-edit{
+    background:var(--surf);color:var(--ink);
+    border-color:var(--brd);
+}
+body.edit-mode .descr-edit:focus{
+    border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft);
+}
+
+/* Per-track ⋮ trigger + popover */
+.track-menu-wrap{position:relative;flex:none}
+.track-menu-btn{
+    min-width:30px;min-height:30px;padding:0;
+    border:1px solid transparent;border-radius:50%;
+    font-size:18px;line-height:1;color:var(--mut);
+}
+.track-menu-btn:hover{color:var(--ink);border-color:var(--brd)}
+.track-menu-pop{
+    position:absolute;top:calc(100% + 4px);right:0;z-index:50;
+    background:var(--surf);
+    border:1px solid var(--brd);
+    border-radius:10px;padding:4px;min-width:160px;
+    box-shadow:0 8px 20px -8px color-mix(in oklab, var(--ink) 30%, transparent);
+}
+.track-menu-pop[hidden]{display:none}
+.track-menu-pop button, .track-menu-pop a{
+    display:flex;align-items:center;gap:10px;
+    width:100%;padding:8px 10px;
+    background:transparent;border:0;border-radius:6px;
+    font:13px var(--font);color:var(--ink);text-decoration:none;
+    text-align:left;cursor:pointer;
+}
+.track-menu-pop button:hover, .track-menu-pop a:hover{
+    background:color-mix(in oklab, var(--ink) 6%, transparent);
+}
+.track-menu-pop svg{width:14px;height:14px;fill:currentColor;flex:none}
