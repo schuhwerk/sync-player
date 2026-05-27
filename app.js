@@ -446,10 +446,12 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:' && window.isSe
 }
 window.addEventListener('online', () => setNetworkState('online'));
 window.addEventListener('offline', () => setNetworkState('offline'));
-// ## js-cache — IndexedDB stores (waveforms, listings, pinned, audio), computePeaks
+// ## js-cache — IndexedDB stores (waveforms, listings, pinned, audio), session bytes, computePeaks
 // IndexedDB stores precomputed waveform peaks per file (Float32Array of length WF_PEAKS).
 // Key: `${path}::${lastModified}` — changing lm invalidates old peaks.
-// Encoded audio bytes use the browser HTTP cache (PHP forwards Cache-Control / Last-Modified).
+// Non-pinned encoded bytes also get a tab-scoped LRU in RAM so revisiting a folder
+// in the same session doesn't re-fetch everything. Long-lived offline copies still
+// live in IndexedDB behind the explicit "Available offline" toggle.
 // 500 covers a ~500px-wide waveform at 1px/peak — anything denser is wasted on
 // every layout we ship. Halves the cached Float32Array per file.
 const WF_PEAKS = 500;
@@ -457,8 +459,22 @@ const DB_NAME = 'syncplayer';
 const STORE = 'waveforms', LIST_STORE = 'listings', PINNED_STORE = 'pinned', AUDIO_STORE = 'audio';
 const TREE_STORAGE_KEY = `syncplayer.tree::${CFG.adapterId || 'default'}`;
 const TREE_CRAWL_MAX_DEPTH = 1;
+const SESSION_AUDIO_CACHE_LIMIT = (() => {
+    const mem = Number(navigator.deviceMemory || 0);
+    if (IS_MOBILE) {
+        if (mem >= 8) return 64 * 1024 * 1024;
+        if (mem >= 4) return 32 * 1024 * 1024;
+        return 16 * 1024 * 1024;
+    }
+    if (mem >= 16) return 192 * 1024 * 1024;
+    if (mem >= 8) return 128 * 1024 * 1024;
+    if (mem >= 4) return 96 * 1024 * 1024;
+    return 64 * 1024 * 1024;
+})();
 
 let _dbPromise = null;
+const _sessionAudioCache = new Map();
+let _sessionAudioCacheBytes = 0;
 const openDB = () => {
     if (_dbPromise) return _dbPromise;
     _dbPromise = new Promise((res, rej) => {
@@ -522,6 +538,53 @@ const audioCacheGet = key      => storeGet(AUDIO_STORE, key);
 const audioCachePut = (key, v) => storePut(AUDIO_STORE, key, v);
 const audioCacheDel = key      => storeDel(AUDIO_STORE, key);
 const audioKey      = f        => `${f.path}::${f.lm || ''}`;
+
+function cloneBytes(bytes) {
+    return bytes instanceof ArrayBuffer ? bytes.slice(0) : bytes;
+}
+
+function sessionAudioCacheGet(key) {
+    const hit = _sessionAudioCache.get(key);
+    if (!hit) return null;
+    _sessionAudioCache.delete(key);
+    _sessionAudioCache.set(key, hit);
+    return cloneBytes(hit.bytes);
+}
+
+function sessionAudioCachePut(key, bytes) {
+    if (!(bytes instanceof ArrayBuffer) || !SESSION_AUDIO_CACHE_LIMIT) return;
+    const size = bytes.byteLength || 0;
+    if (!size || size > SESSION_AUDIO_CACHE_LIMIT) return;
+    const prev = _sessionAudioCache.get(key);
+    if (prev) _sessionAudioCacheBytes -= prev.size;
+    _sessionAudioCache.delete(key);
+    _sessionAudioCache.set(key, { bytes: cloneBytes(bytes), size });
+    _sessionAudioCacheBytes += size;
+    while (_sessionAudioCacheBytes > SESSION_AUDIO_CACHE_LIMIT && _sessionAudioCache.size > 1) {
+        const oldestKey = _sessionAudioCache.keys().next().value;
+        if (typeof oldestKey === 'undefined') break;
+        const oldest = _sessionAudioCache.get(oldestKey);
+        _sessionAudioCache.delete(oldestKey);
+        _sessionAudioCacheBytes -= oldest?.size || 0;
+    }
+}
+
+async function loadCachedBytes(file, options = {}) {
+    const key = audioKey(file);
+    let bytes = sessionAudioCacheGet(key);
+    if (bytes) return { bytes, source: 'session' };
+    bytes = await audioCacheGet(key);
+    if (bytes) {
+        sessionAudioCachePut(key, bytes);
+        return { bytes, source: 'idb' };
+    }
+    bytes = await loadBytes(file.path);
+    sessionAudioCachePut(key, bytes);
+    if (options.persist) {
+        try { await audioCachePut(key, bytes); } catch (_) {}
+    }
+    return { bytes, source: 'network' };
+}
 
 const storeGetAllKeys = async (store) => {
     try {
@@ -753,10 +816,13 @@ class SyncPlayer {
         this._emitRafId = 0;
         this._ctxHoldCount = 0;
         this._ctxSuspendTimer = 0;
+        this._playbackEndTimer = 0;
+        this._closeCtxWhenIdle = false;
         this._destroyed = false;
         this._gestureUnlocked = false; // AudioContext unlocked via a user gesture
         this._earlyDecodeWanted = false; // gesture fired before fetch completed
         this._sourceRunId = 0;
+        this.limiter = null;
     }
 
     _startTickLoop() {
@@ -776,23 +842,63 @@ class SyncPlayer {
         clearTimeout(this._ctxSuspendTimer);
         this._ctxSuspendTimer = 0;
     }
+    _clearPlaybackEndTimer() {
+        if (!this._playbackEndTimer) return;
+        clearTimeout(this._playbackEndTimer);
+        this._playbackEndTimer = 0;
+    }
+    _closeCtxNow() {
+        const ctx = this.ctx;
+        this.ctx = null;
+        this.gains = [];
+        this.limiter = null;
+        this._closeCtxWhenIdle = false;
+        if (!ctx) return;
+        try { ctx.close(); } catch(e) {}
+    }
     _resumeCtx() {
         const ctx = this._ctx();
+        this._closeCtxWhenIdle = false;
         this._clearCtxSuspendTimer();
         try { ctx.resume(); } catch(e) {}
         return ctx;
     }
     _scheduleCtxSuspend() {
-        if (!this.ctx) return;
+        if (!this.ctx) { this._closeCtxWhenIdle = false; return; }
         this._clearCtxSuspendTimer();
         if (this.isPlay || this._ctxHoldCount > 0) return;
         // Let the current event turn finish first so transient UI sounds can chain
         // without fighting an immediate suspend/resume.
         this._ctxSuspendTimer = setTimeout(() => {
             this._ctxSuspendTimer = 0;
-            if (!this.ctx || this.isPlay || this._ctxHoldCount > 0 || this.ctx.state === 'closed') return;
-            try { this.ctx.suspend(); } catch(e) {}
+            const ctx = this.ctx;
+            if (!ctx || this.isPlay || this._ctxHoldCount > 0) return;
+            if (this._closeCtxWhenIdle) {
+                this._closeCtxNow();
+                return;
+            }
+            if (ctx.state === 'closed') return;
+            try { ctx.suspend(); } catch(e) {}
         }, 0);
+    }
+    _schedulePlaybackEnd(runId) {
+        this._clearPlaybackEndTimer();
+        const schedule = delayMs => {
+            this._playbackEndTimer = setTimeout(() => {
+                this._playbackEndTimer = 0;
+                if (!this.isPlay || runId !== this._sourceRunId) return;
+                this._syncCurrentTime();
+                const remainingMs = Math.max(0, (this.duration - this.currentTime) * 1000);
+                if (remainingMs > 120) {
+                    const ctx = this.ctx;
+                    schedule((!ctx || ctx.state === 'running') ? remainingMs + 80 : Math.min(remainingMs + 80, 1000));
+                    return;
+                }
+                this._handlePlaybackEnded(runId);
+            }, Math.max(0, Math.ceil(delayMs)));
+        };
+        const remainingMs = Math.max(0, (this.duration - this.currentTime) * 1000);
+        schedule(remainingMs + 80);
     }
     holdContext() {
         this._ctxHoldCount++;
@@ -812,19 +918,21 @@ class SyncPlayer {
     _ctx() {
         if (!this.ctx) {
             this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const ctx = this.ctx;
             // Soft limiter: stops multi-track sums from clipping at the output.
-            const lim = this.ctx.createDynamicsCompressor();
+            const lim = ctx.createDynamicsCompressor();
             lim.threshold.value = -3; lim.knee.value = 0; lim.ratio.value = 20;
             lim.attack.value = 0.003; lim.release.value = 0.1;
-            lim.connect(this.ctx.destination);
+            lim.connect(ctx.destination);
             this.limiter = lim;
             // Browser can auto-suspend the context (tab backgrounding, BT device change,
             // inactivity). When it resumes and we're supposed to be playing AND lost our
             // sources, restart them — otherwise the UI shows "playing" but is silent.
             // The `sources.length === 0` guard avoids racing with our own explicit
             // resume() inside play(), which would otherwise double-start the sources.
-            this.ctx.addEventListener('statechange', () => {
-                if (this.ctx.state === 'running' && this.isPlay && this.sources.length === 0) {
+            ctx.addEventListener('statechange', () => {
+                if (this.ctx !== ctx) return;
+                if (ctx.state === 'running' && this.isPlay && this.sources.length === 0) {
                     this._restartSources();
                 }
             });
@@ -838,9 +946,11 @@ class SyncPlayer {
     }
     _invalidateSourceRun() {
         this._sourceRunId++;
+        this._clearPlaybackEndTimer();
     }
     _handlePlaybackEnded(runId) {
         if (!this.isPlay || runId !== this._sourceRunId) return;
+        this._clearPlaybackEndTimer();
         this.currentTime = this.duration;
         this.sources = [];
         if (this.repeat) {
@@ -903,11 +1013,8 @@ class SyncPlayer {
                 const cached = wfHidden ? null : await cacheGet(key);
                 if (this._destroyed) return;
                 if (cached?.peaks) { this.peaks[i] = cached.peaks; this._emit(); }
-                const ak = audioKey(f);
-                let bytes = await audioCacheGet(ak);
-                const source = bytes ? 'idb' : 'network';
+                const { bytes, source } = await loadCachedBytes(f);
                 inspect('player:track-source', { loadId, index: i, path: f.path, source });
-                if (!bytes) bytes = await loadBytes(f.path);
                 if (this._destroyed) return;
                 fetched++;
                 this.fetchedFraction = total ? fetched / total : 1;
@@ -1108,6 +1215,7 @@ class SyncPlayer {
         });
         this.sources = nextSources;
         this._playbackBase = ctx.currentTime - startAt;
+        this._schedulePlaybackEnd(runId);
     }
 
     async play() {
@@ -1148,8 +1256,9 @@ class SyncPlayer {
         this.isPlay = false;
         this._stopTickLoop();
         // Release the audio hardware so Bluetooth output reverts to other apps.
-        // Browsers only drop the device when the context is suspended (or closed);
-        // a running context with no sources still holds the sink open.
+        // Browsers only drop the device when the context is suspended or closed.
+        // Close it on an explicit pause so the next play() recreates a clean sink.
+        this._closeCtxWhenIdle = true;
         this._scheduleCtxSuspend();
         this._emit();
     }
@@ -1221,6 +1330,7 @@ class SyncPlayer {
         this._stopTickLoop();
         if (this._emitRafId) { cancelAnimationFrame(this._emitRafId); this._emitRafId = 0; }
         this._clearCtxSuspendTimer();
+        this._clearPlaybackEndTimer();
         this._ctxHoldCount = 0;
         this._invalidateSourceRun();
         this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
@@ -1230,7 +1340,7 @@ class SyncPlayer {
         this._encoded = [];
         this.buffers = [];
         this.peaks = [];
-        try { this.ctx?.close(); } catch(e) {}
+        this._closeCtxNow();
     }
 }
 // ## js-waveform — precomputed peaks → DPR-aware canvas with played overlay
@@ -2535,12 +2645,7 @@ function canPreviewAttachment(file) {
 }
 
 async function loadAttachmentBytes(file) {
-    const key = audioKey(file);
-    let bytes = await audioCacheGet(key);
-    if (bytes) return bytes;
-    bytes = await loadBytes(file.path);
-    try { await audioCachePut(key, bytes); } catch (_) {}
-    return bytes;
+    return (await loadCachedBytes(file, { persist: true })).bytes;
 }
 
 function attachmentPreviewURL(file, blobUrl) {

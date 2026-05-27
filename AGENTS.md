@@ -65,7 +65,8 @@ JS (`app.js`):
   indirection that lets the same `app.js` work for both targets.
   `navigate()` uses `pushState` when SyncBackend is present (root folder
   lives in memory; reload would lose it), `location.search =` otherwise.
-- `js-cache` — IndexedDB `syncplayer.waveforms`. Key `${path}::${lm}`.
+- `js-cache` — IndexedDB `syncplayer.waveforms` + a tab-scoped RAM LRU for raw
+  bytes. Keys stay `${path}::${lm}` so changed files miss both caches cleanly.
 - `js-player` — `SyncPlayer` class. One `AudioContext`, one persistent
   `GainNode` per track; `AudioBufferSourceNode`s recreated on play/seek
   (they are one-shot). `onChange(state)` drives UI re-render. 120ms tick.
@@ -89,6 +90,7 @@ Browser adapter (`adapters/browser-fs.js`):
 
 | What                | Where             | Key                         | Invalidation            |
 | ------------------- | ----------------- | --------------------------- | ----------------------- |
+| Encoded audio bytes (session) | RAM LRU | `${path}::${lm}` | tab close / LRU eviction |
 | Encoded audio bytes | Browser HTTP cache | request URL                 | PHP forwards Last-Modified / ETag → 304 |
 | Encoded audio bytes (pinned) | IndexedDB `audio` | `${path}::${lm}`     | unpin evicts; new `lm` writes new entry |
 | Waveform peaks      | IndexedDB          | `${path}::${lm}`            | `lm` changes → new key  |
