@@ -22,6 +22,13 @@ Copy `config.example.php` to `config.php` and edit it, or set the matching `SYNC
 
 Password-protected Nextcloud shares prompt on first 401.
 
+## Security Note
+
+For convenience, entered share/app passwords are stored in browser `localStorage`
+under adapter-scoped keys (`spw_<adapterId>` and `apw_<adapterId>`). This is
+plain text in the browser profile storage, so use only on trusted devices and
+browsers.
+
 ## Files
 
 - `index.php` — PHP API + adapters + HTML shell

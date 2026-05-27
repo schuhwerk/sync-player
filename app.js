@@ -4,8 +4,32 @@
 // ## js-config — CFG, api/loadBytes dispatch, navigate, SW registration
 const CFG = window.CFG;
 CFG.canWrite = !!CFG.canWrite;
-try { CFG.pw    = sessionStorage.getItem('spw_' + CFG.adapterId) || ''; } catch(e) {}
-try { CFG.appPw = sessionStorage.getItem('apw_' + CFG.adapterId) || ''; } catch(e) {}
+
+function readStoredAuth(key) {
+    try {
+        const val = localStorage.getItem(key);
+        if (val !== null) return val;
+    } catch (e) {}
+    try {
+        const legacy = sessionStorage.getItem(key);
+        if (legacy !== null) {
+            try { localStorage.setItem(key, legacy); } catch (e) {}
+            return legacy;
+        }
+    } catch (e) {}
+    return '';
+}
+
+function writeStoredAuth(key, val) {
+    try {
+        localStorage.setItem(key, val);
+        return;
+    } catch (e) {}
+    try { sessionStorage.setItem(key, val); } catch (e) {}
+}
+
+CFG.pw = readStoredAuth('spw_' + CFG.adapterId);
+CFG.appPw = readStoredAuth('apw_' + CFG.adapterId);
 
 // Touch-only devices get cheaper defaults: no waveforms, no stage, sequential decode.
 // hover:none + pointer:coarse identifies phones/tablets regardless of viewport size,
@@ -2891,7 +2915,7 @@ window.submitPw = (e, isApp) => {
     _authFeedback = isApp ? 'app' : 'share';
     const key = isApp ? 'apw_' : 'spw_';
     if (isApp) CFG.appPw = val; else CFG.pw = val;
-    try { sessionStorage.setItem(key + CFG.adapterId, val); } catch(e) {}
+    writeStoredAuth(key + CFG.adapterId, val);
     init();
     return false;
 };
