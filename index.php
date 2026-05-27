@@ -911,7 +911,7 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
         <span class="lbl">Inspection logging</span>
         <span class="switch" aria-hidden="true"></span>
     </button>
-    <p class="info" id="menu-inspect-info">Shows recent events in a floating panel (and keeps an in-memory ring buffer — <code>SyncInspect.dump()</code> in the console).</p>
+    <p class="info" id="menu-inspect-info">Shows recent events in a floating panel, mirrors them to <code>console.debug</code>, and keeps an in-memory ring buffer — <code>SyncInspect.dump()</code>.</p>
     <hr>
     <a class="row" id="menu-cloud" href="#" target="_blank" rel="noopener" role="menuitem" hidden>
         <span class="lbl">Open externally</span>

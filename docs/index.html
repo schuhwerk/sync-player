@@ -1,4 +1,4 @@
-<!-- Sync Player — built v1779882006 -->
+<!-- Sync Player — built v1779882639 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1254,7 +1254,7 @@ body.edit-mode .descr-edit:focus{
         <span class="lbl">Inspection logging</span>
         <span class="switch" aria-hidden="true"></span>
     </button>
-    <p class="info" id="menu-inspect-info">Shows recent events in a floating panel (and keeps an in-memory ring buffer — <code>SyncInspect.dump()</code> in the console).</p>
+    <p class="info" id="menu-inspect-info">Shows recent events in a floating panel, mirrors them to <code>console.debug</code>, and keeps an in-memory ring buffer — <code>SyncInspect.dump()</code>.</p>
     <hr>
     <a class="row" id="menu-cloud" href="#" target="_blank" rel="noopener" role="menuitem" hidden>
         <span class="lbl">Open externally</span>
@@ -1633,6 +1633,7 @@ const INSPECT_KEY = 'syncplayer.inspect';
 const INSPECT_MAX = 160;
 let _inspectEnabled = false;
 const _inspectEvents = [];
+let _inspectSeq = 0;
 
 function searchParams() {
     return new URLSearchParams(location.search);
@@ -1675,6 +1676,26 @@ function inspect(type, detail) {
         _inspectEvents.splice(0, _inspectEvents.length - INSPECT_MAX);
     }
     renderInspectRow(evt);
+    try {
+        console.debug('[syncplayer]', type, evt);
+    } catch (_) {}
+}
+
+function nextInspectId(prefix) {
+    _inspectSeq += 1;
+    return `${prefix}-${_inspectSeq}`;
+}
+
+function inspectResultSummary(data) {
+    return {
+        stale: !!data?._stale,
+        appAuth: !!data?._appAuth,
+        shareAuth: !!data?._auth,
+        folders: Array.isArray(data?.folders) ? data.folders.length : 0,
+        files: Array.isArray(data?.files) ? data.files.length : 0,
+        attachments: Array.isArray(data?.attachments) ? data.attachments.length : 0,
+        error: data?.error || '',
+    };
 }
 
 // Floating bottom-right panel mirroring _inspectEvents — the only practical way
@@ -1766,7 +1787,26 @@ function apiCacheKey(mode, path) {
     return null;
 }
 
-const api = window.SyncBackend?.api || (async (mode, path, extra) => {
+const backendApi = window.SyncBackend?.api || null;
+const api = async (mode, path, extra) => {
+    const reqId = nextInspectId(`api-${mode}`);
+    inspect('api:start', () => ({
+        reqId,
+        mode,
+        path,
+        via: backendApi ? 'adapter' : 'http',
+        extra: extra && Object.keys(extra).length ? extra : null,
+    }));
+    if (backendApi) {
+        try {
+            const data = await backendApi(mode, path, extra);
+            inspect('api:done', () => ({ reqId, mode, path, via: 'adapter', ...inspectResultSummary(data) }));
+            return data;
+        } catch (e) {
+            inspect('api:error', { reqId, mode, path, via: 'adapter', message: e?.message || String(e) });
+            throw e;
+        }
+    }
     // Cache list/search/meta in IDB so reloading offline still shows the last
     // known content. We have two distinct failure modes to handle:
     //   - true network failure: fetch() rejects (handled in catch).
@@ -1777,57 +1817,125 @@ const api = window.SyncBackend?.api || (async (mode, path, extra) => {
     const cacheKey = apiCacheKey(mode, path, extra);
     try {
         const r = await fetch('?' + qs(mode, path, extra));
-        if (r.status === 401) return parseAuth(r);
+        if (r.status === 401) {
+            const auth = await parseAuth(r);
+            inspect('api:auth', { reqId, mode, path, via: 'http', throttled: !!auth.throttled, app: !!auth._appAuth });
+            return auth;
+        }
         const data = await r.json();
         if (cacheKey && !data.error && !data._auth && !data._appAuth) listCachePut(cacheKey, data);
         if (data.error && cacheKey) {
             const cached = await listCacheGet(cacheKey);
-            if (cached) return { ...cached, _stale: true };
+            if (cached) {
+                inspect('api:done', () => ({
+                    reqId,
+                    mode,
+                    path,
+                    via: 'http',
+                    status: r.status,
+                    cacheFallback: true,
+                    ...inspectResultSummary({ ...cached, _stale: true }),
+                }));
+                return { ...cached, _stale: true };
+            }
         }
+        inspect('api:done', () => ({ reqId, mode, path, via: 'http', status: r.status, ...inspectResultSummary(data) }));
         return data;
     } catch (e) {
         if (cacheKey) {
             const cached = await listCacheGet(cacheKey);
-            if (cached) return { ...cached, _stale: true };
+            if (cached) {
+                inspect('api:done', () => ({
+                    reqId,
+                    mode,
+                    path,
+                    via: 'http',
+                    cacheFallback: true,
+                    ...inspectResultSummary({ ...cached, _stale: true }),
+                }));
+                return { ...cached, _stale: true };
+            }
         }
+        inspect('api:error', { reqId, mode, path, via: 'http', message: e?.message || String(e) });
         throw e;
     }
-});
+};
 
 async function fetchFreshList(path) {
+    const reqId = nextInspectId('tree-list');
+    inspect('tree:list:start', { reqId, path });
     const r = await fetch('?' + qs('list', path));
-    if (r.status === 401) return parseAuth(r);
+    if (r.status === 401) {
+        const auth = await parseAuth(r);
+        inspect('tree:list:auth', { reqId, path, throttled: !!auth.throttled, app: !!auth._appAuth });
+        return auth;
+    }
     const data = await r.json();
     if (!data.error && !data._auth && !data._appAuth) listCachePut(`list::${path}`, data);
+    inspect('tree:list:done', () => ({ reqId, path, status: r.status, ...inspectResultSummary(data) }));
     return data;
 }
 
-const apiPost = window.SyncBackend?.apiPost || (async (mode, path, body) => {
+const backendApiPost = window.SyncBackend?.apiPost || null;
+const apiPost = async (mode, path, body) => {
+    const reqId = nextInspectId(`post-${mode}`);
+    inspect('api-post:start', { reqId, mode, path, via: backendApiPost ? 'adapter' : 'http' });
+    if (backendApiPost) {
+        try {
+            const data = await backendApiPost(mode, path, body);
+            inspect('api-post:done', () => ({ reqId, mode, path, via: 'adapter', ...inspectResultSummary(data) }));
+            return data;
+        } catch (e) {
+            inspect('api-post:error', { reqId, mode, path, via: 'adapter', message: e?.message || String(e) });
+            throw e;
+        }
+    }
     const r = await fetch('?' + qs(mode, path), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
     });
-    if (r.status === 401) return parseAuth(r);
-    return r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-});
+    if (r.status === 401) {
+        const auth = await parseAuth(r);
+        inspect('api-post:auth', { reqId, mode, path, via: 'http', throttled: !!auth.throttled, app: !!auth._appAuth });
+        return auth;
+    }
+    const data = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+    inspect('api-post:done', () => ({ reqId, mode, path, via: 'http', status: r.status, ...inspectResultSummary(data) }));
+    return data;
+};
 
-const loadBytes = window.SyncBackend?.loadBytes
-    || (async path => {
+const backendLoadBytes = window.SyncBackend?.loadBytes || null;
+const loadBytes = async path => {
+    const reqId = nextInspectId('bytes');
+    inspect('bytes:start', { reqId, path, via: backendLoadBytes ? 'adapter' : 'http' });
+    if (backendLoadBytes) {
         try {
-            const r = await fetch('?' + qs('fetch', path));
-            if (!r.ok) {
-                setNetworkState(r.status >= 500 ? 'offline' : _networkState);
-                throw new Error(`HTTP ${r.status}`);
-            }
-            setNetworkState('online');
-            return r.arrayBuffer();
+            const bytes = await backendLoadBytes(path);
+            inspect('bytes:done', { reqId, path, via: 'adapter', bytes: bytes?.byteLength || 0 });
+            return bytes;
         } catch (e) {
-            setNetworkState('offline');
-            inspect('audio:fetch-error', { path, message: e?.message || String(e) });
+            inspect('bytes:error', { reqId, path, via: 'adapter', message: e?.message || String(e) });
             throw e;
         }
-    });
+    }
+    try {
+        const r = await fetch('?' + qs('fetch', path));
+        if (!r.ok) {
+            setNetworkState(r.status >= 500 ? 'offline' : _networkState);
+            throw new Error(`HTTP ${r.status}`);
+        }
+        const bytes = await r.arrayBuffer();
+        setNetworkState('online');
+        inspect('bytes:done', { reqId, path, via: 'http', status: r.status, bytes: bytes.byteLength });
+        return bytes;
+    } catch (e) {
+        setNetworkState('offline');
+        inspect('bytes:error', { reqId, path, via: 'http', message: e?.message || String(e) });
+        inspect('audio:fetch-error', { path, message: e?.message || String(e) });
+        throw e;
+    }
+};
 
 function fileHref(path, download = false) {
     if (window.SyncBackend) return '#';
@@ -2098,14 +2206,15 @@ async function updateTreeEntry(path, data) {
     return next[path];
 }
 
-async function fetchTree() {
+async function fetchTree(rootPath = CFG.path || '/', maxDepth = TREE_CRAWL_MAX_DEPTH) {
     if (_treeRefreshPromise) return _treeRefreshPromise;
     _treeRefreshPromise = (async () => {
         const tree = {};
         const stalePaths = new Set();
         const visited = new Set();
-        const queue = [{ path: '/', depth: 0 }];
+        const queue = [{ path: rootPath || '/', depth: 0 }];
         let isComplete = true;
+        inspect('tree:refresh-start', { rootPath: rootPath || '/', maxDepth });
         while (queue.length) {
             const next = queue.shift();
             const path = next?.path;
@@ -2117,7 +2226,7 @@ async function fetchTree() {
             if (!data || data.error || data._auth || data._appAuth) { isComplete = false; continue; }
             const entry = normalizeTreeEntry(data);
             tree[path] = entry;
-            if (depth < TREE_CRAWL_MAX_DEPTH) {
+            if (depth < maxDepth) {
                 for (const folder of entry.folders) {
                     if (!visited.has(folder.path)) queue.push({ path: folder.path, depth: depth + 1 });
                 }
@@ -2128,6 +2237,12 @@ async function fetchTree() {
             await persistTree(_tree);
             syncFolderFilterUI();
         }
+        inspect('tree:refresh-done', {
+            rootPath: rootPath || '/',
+            maxDepth,
+            fetchedPaths: Object.keys(tree).length,
+            complete: isComplete,
+        });
         return _tree;
     })();
     try {
@@ -2137,15 +2252,15 @@ async function fetchTree() {
     }
 }
 
-function refreshTreeInBackground() {
-    fetchTree().catch(() => {});
+function refreshTreeInBackground(rootPath = CFG.path || '/', maxDepth = TREE_CRAWL_MAX_DEPTH) {
+    fetchTree(rootPath, maxDepth).catch(() => {});
 }
 
-function scheduleTreeRefresh(delay = 180) {
+function scheduleTreeRefresh(rootPath = CFG.path || '/', delay = 180, maxDepth = TREE_CRAWL_MAX_DEPTH) {
     if (IS_MOBILE || window.SyncBackend || _treeRefreshPromise || _treeRefreshTimer) return;
     _treeRefreshTimer = setTimeout(() => {
         _treeRefreshTimer = 0;
-        refreshTreeInBackground();
+        refreshTreeInBackground(rootPath, maxDepth);
     }, delay);
 }
 
@@ -2343,25 +2458,38 @@ class SyncPlayer {
     }
 
     async load() {
+        const loadId = nextInspectId('player-load');
         const total = this.files.length;
         let fetched = 0;
         this.loadError = '';
+        inspect('player:load-start', { loadId, tracks: total, deferDecode: this._deferDecode });
         // Mobile keeps only two encoded tracks in flight at once; desktop keeps
         // the original parallel fetch behaviour and still decodes sequentially.
         const loadOne = async (f, i) => {
             try {
                 const key = `${f.path}::${f.lm}`;
                 const wfHidden = document.body.classList.contains('hide-wf');
+                inspect('player:track-start', { loadId, index: i, path: f.path, lm: f.lm || '', waveformCached: !wfHidden });
                 const cached = wfHidden ? null : await cacheGet(key);
                 if (this._destroyed) return;
                 if (cached?.peaks) { this.peaks[i] = cached.peaks; this._emit(); }
                 const ak = audioKey(f);
                 let bytes = await audioCacheGet(ak);
+                const source = bytes ? 'idb' : 'network';
+                inspect('player:track-source', { loadId, index: i, path: f.path, source });
                 if (!bytes) bytes = await loadBytes(f.path);
                 if (this._destroyed) return;
                 fetched++;
                 this.fetchedFraction = total ? fetched / total : 1;
                 this._encoded[i] = bytes;
+                inspect('player:track-ready', {
+                    loadId,
+                    index: i,
+                    path: f.path,
+                    source,
+                    bytes: bytes?.byteLength || 0,
+                    fetchedFraction: this.fetchedFraction,
+                });
             } catch (e) {
                 if (this._destroyed) return;
                 this.buffers[i] = null;
@@ -2393,6 +2521,14 @@ class SyncPlayer {
             this._earlyDecodeWanted = false;
             this._tryEarlyDecode();
         }
+        inspect('player:load-done', {
+            loadId,
+            tracks: total,
+            fetched: this.files.filter((_, i) => !!this._encoded[i] || !!this.buffers[i]).length,
+            decoded: this.buffers.filter(Boolean).length,
+            duration: this.duration,
+            loadError: this.loadError || '',
+        });
     }
 
     _maybePredecode() {
@@ -2645,6 +2781,12 @@ class SyncPlayer {
     }
     toggleRepeat() { this.repeat = !this.repeat; this._emit(); }
     destroy() {
+        inspect('player:destroy', {
+            tracks: this.files.length,
+            hadBuffers: this.buffers.filter(Boolean).length,
+            hadEncoded: this._encoded.filter(Boolean).length,
+            wasPlaying: this.isPlay,
+        });
         this._destroyed = true;
         this._stopTickLoop();
         if (this._emitRafId) { cancelAnimationFrame(this._emitRafId); this._emitRafId = 0; }
@@ -3224,7 +3366,7 @@ async function pinCurrentFolder() {
     _pinState = { pinned: true, caching: true, done: 0, total: 0, error: '' };
     syncOfflineUI();
 
-    if (!_tree) await fetchTree().catch(() => {});
+    if (!_tree) await fetchTree(CFG.path || '/', Infinity).catch(() => {});
 
     const pfx = CFG.path;
     const allItems = _tree
@@ -4339,7 +4481,9 @@ async function init() {
         return;
     }
     await updateTreeEntry(myPath, data).catch(() => {});
-    scheduleTreeRefresh(renderedFromCache ? 240 : 80);
+    if ((data.folders || []).length) {
+        scheduleTreeRefresh(myPath, renderedFromCache ? 240 : 80);
+    }
     if (data.files?.length || data.attachments?.length) {
         const meta = await loadFolderMeta(myPath);
         if (!stillCurrent()) return;
@@ -4540,6 +4684,12 @@ function renderView(data) {
     const attachments = data.attachments || [];
     const reusePlayer = !!(player && files.length && sameFileEntries(player.files, files));
     inspect('render', { folders: _folderState.length, files: files.length, attachments: attachments.length });
+    inspect('render:player', {
+        files: files.length,
+        reusePlayer,
+        hadPlayer: !!player,
+        playerWasPlaying: !!player?.isPlay,
+    });
     const foldersBlock = _folderState.length && !files.length ? `
         <div class="folders-wrap">
             <div class="filter">
@@ -4573,8 +4723,13 @@ function renderView(data) {
         observeWaveformLayouts();
         initStage(files);
         syncBaseToneUI();
-        if (reusePlayer) onPlayerChange(player);
-        else player.load();
+        if (reusePlayer) {
+            inspect('player:reuse', { files: files.length });
+            onPlayerChange(player);
+        } else {
+            inspect('player:create', { files: files.length });
+            player.load();
+        }
     } else if (player) {
         player.destroy(); player = null;
         clearPlayerUICache();
