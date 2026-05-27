@@ -1,4 +1,4 @@
-<!-- Sync Player — built v1779883337 -->
+<!-- Sync Player — built v1779883694 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1616,6 +1616,13 @@ const MOBILE_PREDECODE_LIMIT = (() => {
     if (mem > 0) return 0;
     return 8 * 1024 * 1024;
 })();
+const DESKTOP_DECODE_CONCURRENCY = (() => {
+    if (IS_MOBILE) return 1;
+    const cores = Number(navigator.hardwareConcurrency || 0);
+    if (cores >= 16) return 4;
+    if (cores >= 8) return 3;
+    return 2;
+})();
 const VOLUME_SLIDER_MIN = 0;
 const VOLUME_SLIDER_MAX = 100;
 const DEFAULT_VOLUME = 0.5;
@@ -2353,6 +2360,10 @@ async function forEachConcurrent(items, limit, fn) {
     await Promise.all(workers);
 }
 
+function nextTask() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+}
+
 class SyncPlayer {
     constructor(files, onChange) {
         this.files = files;
@@ -2371,7 +2382,8 @@ class SyncPlayer {
         // On mobile we postpone decodeAudioData until the user actually presses
         // play, but the play button still needs to enable after the bytes are
         // available. fetchedFraction tracks fetch completion; loadedFraction
-        // tracks decode completion. Desktop keeps both moving in lockstep.
+        // tracks decode completion / play readiness. Desktop waveforms keep
+        // filling in after loadedFraction hits 1.
         this.fetchedFraction = 0;
         this.loadedFraction = 0;
         this.loadError = '';
@@ -2392,6 +2404,7 @@ class SyncPlayer {
         this._gestureUnlocked = false; // AudioContext unlocked via a user gesture
         this._earlyDecodeWanted = false; // gesture fired before fetch completed
         this._sourceRunId = 0;
+        this._waveformPromise = null;
         this.limiter = null;
     }
 
@@ -2574,7 +2587,7 @@ class SyncPlayer {
         this.loadError = '';
         inspect('player:load-start', { loadId, tracks: total, deferDecode: this._deferDecode });
         // Mobile keeps only two encoded tracks in flight at once; desktop keeps
-        // the original parallel fetch behaviour and still decodes sequentially.
+        // the original parallel fetch behaviour and then decodes a few tracks at once.
         const loadOne = async (f, i) => {
             try {
                 const key = `${f.path}::${f.lm}`;
@@ -2646,53 +2659,100 @@ class SyncPlayer {
         this._decodeAll();
     }
 
-    // Run decodeAudioData for every fetched track. Sequential to keep peak
-    // memory low — at any moment only one ArrayBuffer + its decoded buffer
-    // are live. Encoded bytes are nulled out as we go so they can be GC'd.
+    _buildMissingPeaksInBackground() {
+        if (this._destroyed || this._waveformPromise || document.body.classList.contains('hide-wf')) return;
+        const waveforms = (async () => {
+            for (let i = 0; i < this.buffers.length; i++) {
+                if (this._destroyed || document.body.classList.contains('hide-wf')) return;
+                const buf = this.buffers[i];
+                if (!buf || this.peaks[i]) continue;
+                await nextTask();
+                if (this._destroyed || document.body.classList.contains('hide-wf')) return;
+                this.peaks[i] = computePeaks(buf);
+                const f = this.files[i];
+                cachePut(`${f.path}::${f.lm}`, { peaks: this.peaks[i] });
+                this._emit();
+            }
+        })();
+        this._waveformPromise = waveforms;
+        waveforms.finally(() => {
+            if (this._waveformPromise === waveforms) this._waveformPromise = null;
+        });
+    }
+
+    // Run decodeAudioData for every fetched track. Mobile stays sequential to
+    // keep memory low; desktop decodes a few tracks in parallel, then computes
+    // any missing waveforms afterward so controls unlock as soon as playback is ready.
     async _decodeAll() {
         if (this._destroyed) return;
         if (this._decodePromise) return this._decodePromise;
         this._decodePromise = (async () => {
-            const wfHidden = document.body.classList.contains('hide-wf');
             const total = this.files.length;
-            let decoded = this.buffers.filter(Boolean).length;
-            for (let i = 0; i < total; i++) {
-                if (this._destroyed) return;
-                const bytes = this._encoded[i];
-                if (!bytes || this.buffers[i]) continue;
-                try {
-                    const buf = await this._ctx().decodeAudioData(bytes);
+            if (this._deferDecode) {
+                const wfHidden = document.body.classList.contains('hide-wf');
+                let decoded = this.buffers.filter(Boolean).length;
+                for (let i = 0; i < total; i++) {
                     if (this._destroyed) return;
-                    this.buffers[i] = buf;
-                    this._encoded[i] = null; // release for GC
-                    if (!wfHidden) {
-                        const f = this.files[i];
-                        const key = `${f.path}::${f.lm}`;
-                        const cached = await cacheGet(key);
+                    const bytes = this._encoded[i];
+                    if (!bytes || this.buffers[i]) continue;
+                    try {
+                        const buf = await this._ctx().decodeAudioData(bytes);
                         if (this._destroyed) return;
-                        if (!cached?.peaks) {
-                            this.peaks[i] = computePeaks(this.buffers[i]);
-                            cachePut(key, { peaks: this.peaks[i] });
-                        } else if (!this.peaks[i]) {
-                            this.peaks[i] = cached.peaks;
+                        this.buffers[i] = buf;
+                        this._encoded[i] = null; // release for GC
+                        if (!wfHidden) {
+                            const f = this.files[i];
+                            const key = `${f.path}::${f.lm}`;
+                            const cached = await cacheGet(key);
+                            if (this._destroyed) return;
+                            if (!cached?.peaks) {
+                                this.peaks[i] = computePeaks(this.buffers[i]);
+                                cachePut(key, { peaks: this.peaks[i] });
+                            } else if (!this.peaks[i]) {
+                                this.peaks[i] = cached.peaks;
+                            }
+                        }
+                    } catch (e) {
+                        if (this._destroyed) return;
+                        this.buffers[i] = null;
+                        this._encoded[i] = null;
+                        this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
+                        inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
+                    }
+                    decoded++;
+                    this._emit();
+                }
+            } else {
+                let processed = 0;
+                await forEachConcurrent(this.files, DESKTOP_DECODE_CONCURRENCY, async (_, i) => {
+                    if (this._destroyed) return;
+                    const bytes = this._encoded[i];
+                    if (bytes && !this.buffers[i]) {
+                        try {
+                            this.buffers[i] = await this._ctx().decodeAudioData(bytes);
+                        } catch (e) {
+                            if (this._destroyed) return;
+                            this.buffers[i] = null;
+                            this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
+                            inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
+                        } finally {
+                            this._encoded[i] = null;
                         }
                     }
-                } catch (e) {
                     if (this._destroyed) return;
-                    this.buffers[i] = null;
-                    this._encoded[i] = null;
-                    this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
-                    inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
-                }
-                decoded++;
-                if (!this._deferDecode) this.loadedFraction = total ? decoded / total : 1;
-                this._emit();
+                    processed++;
+                    this.loadedFraction = total ? processed / total : 1;
+                    this._emit();
+                });
             }
             const readyBuffers = this.buffers.filter(Boolean);
             this.duration = readyBuffers.length ? Math.max(...readyBuffers.map(b => b.duration)) : 0;
             if (this._deferDecode) {
                 this._deferDecode = false;
                 this.loadedFraction = 1;
+            } else {
+                this.loadedFraction = 1;
+                this._buildMissingPeaksInBackground();
             }
             this._emit();
         })();
@@ -2735,14 +2795,7 @@ class SyncPlayer {
     // Compute peaks for buffers we skipped (e.g. waveforms started hidden, user
     // toggled them on). Called from applyShowWaveforms. Cheap relative to decode.
     computeMissingPeaks() {
-        for (let i = 0; i < this.buffers.length; i++) {
-            const buf = this.buffers[i];
-            if (!buf || this.peaks[i]) continue;
-            this.peaks[i] = computePeaks(buf);
-            const f = this.files[i];
-            cachePut(`${f.path}::${f.lm}`, { peaks: this.peaks[i] });
-        }
-        this._emit();
+        this._buildMissingPeaksInBackground();
     }
 
     _tick() {
@@ -2910,6 +2963,7 @@ class SyncPlayer {
         this._encoded = [];
         this.buffers = [];
         this.peaks = [];
+        this._waveformPromise = null;
         this._closeCtxNow();
     }
 }
