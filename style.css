@@ -910,13 +910,34 @@ body.edit-mode .edit-chip{display:inline-flex}
 .attachment-chip{
     display:inline-flex;
     align-items:center;
-    gap:8px;
+    gap:6px;
     width:fit-content;
     max-width:100%;
     min-height:34px;
-    padding:5px 6px 5px 5px;
+    padding:4px 4px 4px 5px;
     background:var(--surf);
     border:1px solid var(--brd);
+    border-radius:999px;
+}
+.attachment-primary{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    min-width:0;
+    max-width:100%;
+    padding:0;
+    border:0;
+    background:transparent;
+    color:inherit;
+    cursor:pointer;
+}
+.attachment-primary:hover .attachment-name,
+.attachment-primary:focus-visible .attachment-name{
+    color:var(--acc);
+}
+.attachment-primary:focus-visible{
+    outline:2px solid color-mix(in oklab, var(--acc) 45%, transparent);
+    outline-offset:2px;
     border-radius:999px;
 }
 .attachment-kind-wrap{
@@ -941,48 +962,6 @@ body.edit-mode .edit-chip{display:inline-flex}
     text-transform:uppercase;
     color:var(--ink);
 }
-.attachment-actions{
-    display:flex;
-    gap:8px;
-    flex-wrap:nowrap;
-}
-.attachment-action{
-    flex:none;
-    min-height:24px;
-    padding:0 8px;
-    border:1px solid var(--brd);
-    border-radius:999px;
-    background:transparent;
-    color:var(--ink);
-    font:600 11.5px var(--font);
-    cursor:pointer;
-}
-.attachment-action.on{
-    border-color:var(--acc);
-    color:var(--acc);
-    background:var(--acc-soft);
-}
-.attachment-action:hover{
-    border-color:var(--acc);
-    color:var(--acc);
-}
-.attachment-action.accent{
-    border-color:color-mix(in oklab, var(--acc) 40%, var(--brd));
-    color:var(--acc);
-}
-.attachment-action.accent:hover{
-    border-color:var(--acc);
-    color:var(--ink);
-    background:var(--acc-soft);
-}
-.attachment-action-icon{
-    display:inline-flex;
-    align-items:center;
-    justify-content:center;
-    min-width:24px;
-    width:24px;
-    padding:0;
-}
 .attachment-name{
     min-width:0;
     max-width:min(30ch, calc(100vw - 210px));
@@ -991,6 +970,39 @@ body.edit-mode .edit-chip{display:inline-flex}
     white-space:nowrap;
     font:12.5px var(--font);
     color:var(--ink);
+}
+.attachment-menu-wrap{position:relative;flex:none}
+.attachment-menu-btn,
+.attachment-menu-btn[aria-expanded="true"]{
+    display:inline-flex;align-items:center;justify-content:center;
+    color:var(--ink);border-color:var(--brd);
+}
+.attachment-menu-pop{
+    position:absolute;top:calc(100% + 4px);right:0;z-index:50;
+    background:var(--surf);
+    border:1px solid var(--brd);
+    border-radius:10px;padding:4px;min-width:170px;
+    box-shadow:0 8px 20px -8px color-mix(in oklab, var(--ink) 30%, transparent);
+}
+.attachment-menu-pop[hidden]{display:none}
+.attachment-menu-pop button{
+    display:flex;align-items:center;gap:10px;
+    width:100%;padding:8px 10px;
+    background:transparent;border:0;border-radius:6px;
+    font:13px var(--font);color:var(--ink);
+    text-align:left;cursor:pointer;
+}
+.attachment-menu-pop button:hover,
+.attachment-menu-pop button.on{
+    background:color-mix(in oklab, var(--ink) 6%, transparent);
+}
+.attachment-menu-pop button:disabled{
+    opacity:.55;
+    cursor:progress;
+}
+.attachment-menu-pop svg{
+    width:14px;height:14px;flex:none;
+    fill:currentColor;stroke:currentColor;
 }
 /* Inline square preview: the square has its own border; the .attachment-inline-preview
    wrapper is just a positioning container (no border/background) so the square isn't
@@ -1022,19 +1034,26 @@ body.edit-mode .edit-chip{display:inline-flex}
     height:auto;
     background:color-mix(in oklab, var(--card) 94%, var(--ink) 6%);
 }
-.attachment-inline-media-pdf{
-    width:100%;
-    height:100%;
+.attachment-inline-media-pdf,
+.attachment-fs-media-pdf{
+    display:block;
+    width:100%;height:100%;
     background:#fff;
 }
-.attachment-inline-fallback{
-    display:grid;place-items:center;
+.attachment-pdf-fallback{
+    display:flex;align-items:center;justify-content:center;
     width:100%;height:100%;
-    color:var(--acc);text-decoration:none;
-    font:600 13px var(--font);
+    color:var(--mut);font:600 11px/1 var(--font-num);
+    letter-spacing:.08em;text-transform:uppercase;
+    text-decoration:none;
+}
+.attachment-pdf-open{
+    display:inline-flex;align-items:center;justify-content:center;
+    text-decoration:none;
+    font-size:16px;
 }
 .attachment-inline-overlay-actions{
-    position:absolute;top:8px;right:8px;
+    position:absolute;top:38px;right:8px;
     display:flex;gap:6px;
     z-index:1;
 }
@@ -1067,7 +1086,7 @@ body.edit-mode .edit-chip{display:inline-flex}
 }
 .attachment-fs-actions{
     /* fixed (not absolute): stays in the viewport corner even when the stage scrolls */
-    position:fixed;top:calc(var(--hdr-h) + 12px);right:12px;
+    position:fixed;top:calc(var(--hdr-h) + 40px);right:12px;
     display:flex;gap:6px;
     z-index:36;
 }
@@ -1085,11 +1104,6 @@ body.edit-mode .edit-chip{display:inline-flex}
     height:auto;
     margin:0 auto;
     background:#111;
-}
-.attachment-fs-media-pdf{
-    width:100%;
-    height:100%;
-    background:#fff;
 }
 .descr-edit, .descr-view{
     display:block;width:calc(100% + 20px);
@@ -1124,14 +1138,19 @@ body.edit-mode .descr-edit:focus{
     border-color:var(--acc);box-shadow:0 0 0 4px var(--acc-soft);
 }
 
-/* Per-track ⋮ trigger + popover */
+/* Overflow menu trigger + per-track popover */
 .track-menu-wrap{position:relative;flex:none}
-.track-menu-btn{
+.menu-trigger-btn{
     min-width:30px;min-height:30px;padding:0;
     border:1px solid transparent;border-radius:50%;
     font-size:18px;line-height:1;color:var(--mut);
 }
-.track-menu-btn:hover{color:var(--ink);border-color:var(--brd)}
+.menu-trigger-dots{
+        position:relative;
+        top:-2px;
+        display:inline-block;
+}
+.menu-trigger-btn:hover{color:var(--ink);border-color:var(--brd)}
 .track-menu-pop{
     position:absolute;top:calc(100% + 4px);right:0;z-index:50;
     background:var(--surf);

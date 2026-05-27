@@ -615,6 +615,8 @@ class SyncPlayer {
         this._ctxHoldCount = 0;
         this._ctxSuspendTimer = 0;
         this._destroyed = false;
+        this._gestureUnlocked = false; // AudioContext unlocked via a user gesture
+        this._earlyDecodeWanted = false; // gesture fired before fetch completed
     }
 
     _startTickLoop() {
@@ -770,6 +772,10 @@ class SyncPlayer {
         }
         this._emit();
         this._maybePredecode();
+        if (this._earlyDecodeWanted) {
+            this._earlyDecodeWanted = false;
+            this._tryEarlyDecode();
+        }
     }
 
     _maybePredecode() {
@@ -843,6 +849,27 @@ class SyncPlayer {
         this._decodeAll().finally(() => {
             if (!this.isPlay) hold.release();
         });
+    }
+
+    // Call from any user-gesture handler (pointerdown anywhere on the page).
+    // Unlocks the AudioContext on iOS and starts decoding as soon as bytes are
+    // ready — so play is instant even for large sets that skip _maybePredecode.
+    primeOnGesture() {
+        if (this._destroyed || !this._deferDecode || this.isPlay) return;
+        if (!this._gestureUnlocked) {
+            // Resume within the gesture so iOS marks the context as allowed.
+            // Release right after — we don't want to keep a BT connection alive.
+            const hold = this.holdContext();
+            this._gestureUnlocked = true;
+            Promise.resolve().then(() => { if (!this.isPlay) hold.release(); });
+        }
+        this._tryEarlyDecode();
+    }
+
+    _tryEarlyDecode() {
+        if (this._destroyed || !this._deferDecode || this._decodePromise || this.isPlay) return;
+        if (this.fetchedFraction < 1) { this._earlyDecodeWanted = true; return; }
+        this._decodeAll();
     }
 
     // Compute peaks for buffers we skipped (e.g. waveforms started hidden, user
@@ -2250,7 +2277,7 @@ function bindMenu() {
 // Per-track ⋮ menu — only one open at a time.
 function closeAllTrackMenus() {
     document.querySelectorAll('.track-menu-pop').forEach(p => p.hidden = true);
-    document.querySelectorAll('.track-menu-btn').forEach(b => b.setAttribute('aria-expanded', 'false'));
+    document.querySelectorAll('.menu-trigger-btn').forEach(b => b.setAttribute('aria-expanded', 'false'));
 }
 function toggleTrackMenu(i) {
     const pop = $(`tmenu-${i}`);
@@ -2263,8 +2290,14 @@ function toggleTrackMenu(i) {
     }
 }
 document.addEventListener('click', e => {
-    if (e.target.closest('.track-menu-pop') || e.target.closest('.track-menu-btn')) return;
+    if (
+        e.target.closest('.track-menu-pop')
+        || e.target.closest('.menu-trigger-btn')
+        || e.target.closest('.attachment-menu-pop')
+        || e.target.closest('.attachment-menu-btn')
+    ) return;
     closeAllTrackMenus();
+    closeAllAttachmentMenus();
 });
 
 async function downloadTrackFile(file) {
@@ -2282,8 +2315,38 @@ async function downloadTrackFile(file) {
     a.remove();
 }
 
+async function openAttachmentNewTab(file) {
+    if (!window.SyncBackend) {
+        // Server target: direct URL — synchronous, no popup-blocker risk.
+        window.open('?' + qs('fetch', file.path), '_blank', 'noopener,noreferrer');
+        return;
+    }
+    try {
+        const bytes = await loadAttachmentBytes(file);
+        const url = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+        window.open(url, '_blank', 'noopener,noreferrer');
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (e) {
+        setBaseToneStatus('Could not open: ' + (e?.message || e), true);
+    }
+}
+
 function canPreviewAttachment(file) {
     return file?.kind === 'image' || file?.kind === 'pdf';
+}
+
+async function loadAttachmentBytes(file) {
+    const key = audioKey(file);
+    let bytes = await audioCacheGet(key);
+    if (bytes) return bytes;
+    bytes = await loadBytes(file.path);
+    try { await audioCachePut(key, bytes); } catch (_) {}
+    return bytes;
+}
+
+function attachmentPreviewURL(file, blobUrl) {
+    if (!window.SyncBackend && file?.kind === 'pdf') return fileHref(file.path);
+    return blobUrl;
 }
 
 function attachmentMimeType(file) {
@@ -2302,6 +2365,37 @@ function attachmentMimeType(file) {
 function shortAttachmentName(name, max = 40) {
     if (!name || name.length <= max) return name || '';
     return name.slice(0, Math.max(0, max - 3)) + '...';
+}
+
+function attachmentActionIcon(name) {
+    if (name === 'open') {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42 9.3-9.29H14V3z"/><path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7z"/></svg>';
+    }
+    if (name === 'download') {
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10.59l3.29-3.3 1.42 1.42L12 16.41l-4.71-4.7 1.42-1.42L12 13.59V3z"/><path d="M5 19h14v2H5z"/></svg>';
+    }
+    if (name === 'inline') {
+        return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+    }
+    if (name === 'overlay') {
+        return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 9V3h6"/><path d="M21 9V3h-6"/><path d="M3 15v6h6"/><path d="M21 15v6h-6"/></svg>';
+    }
+    return '';
+}
+
+function attachmentMenuHTML(file, i) {
+    const items = [
+        `<button type="button" data-attachment-opentab="${i}" role="menuitem">${attachmentActionIcon('open')}<span>Open</span></button>`,
+        `<button type="button" data-attachment-download="${i}" role="menuitem">${attachmentActionIcon('download')}<span>Download</span></button>`,
+    ];
+    if (!IS_MOBILE && canPreviewAttachment(file)) {
+        items.push(`<button type="button" data-attachment-open="${i}" role="menuitem">${attachmentActionIcon('inline')}<span>Show here</span></button>`);
+        items.push(`<button type="button" data-attachment-fullscreen="${i}" role="menuitem">${attachmentActionIcon('overlay')}<span>Open large</span></button>`);
+    }
+    return `<div class="attachment-menu-wrap">
+        <button type="button" class="btn menu-trigger-btn attachment-menu-btn" data-attachment-menu="${i}" aria-haspopup="menu" aria-expanded="false" title="More actions" aria-label="More actions for ${escapeHtml(file.name)}"><span class="menu-trigger-dots">⋮</span></button>
+        <div class="attachment-menu-pop" id="attachment-menu-${i}" hidden role="menu">${items.join('')}</div>
+    </div>`;
 }
 
 // Attachment preview has two modes:
@@ -2324,16 +2418,9 @@ const attachmentPreview = {
 
     panel() { return $('attachment-inline-preview'); },
 
-    src(file, url) {
-        if (file.kind === 'pdf') return `${url}#toolbar=0&navpanes=0&scrollbar=0&view=FitH`;
-        return url;
-    },
-
     mediaHTML(file, url, cls) {
         return file.kind === 'pdf'
-            ? `<object class="${cls} ${cls}-pdf" data="${escapeHtml(this.src(file, url))}" type="application/pdf">
-                <a class="attachment-inline-fallback" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Open PDF</a>
-            </object>`
+            ? `<object class="${cls} ${cls}-pdf" data="${escapeHtml(url)}" type="application/pdf"><a class="attachment-pdf-fallback" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Open PDF</a></object>`
             : `<img class="${cls} ${cls}-image" src="${escapeHtml(url)}" alt="${escapeHtml(file.name)}" loading="lazy">`;
     },
 
@@ -2343,6 +2430,12 @@ const attachmentPreview = {
         if (file.kind !== 'image') return '';
         return `<button type="button" class="attachment-stage-btn" data-attachment-zoom-out title="Zoom out" aria-label="Zoom out">−</button>
             <button type="button" class="attachment-stage-btn" data-attachment-zoom-in title="Zoom in" aria-label="Zoom in">+</button>`;
+    },
+
+    // Always-visible open link for PDF — essential on mobile where embedded viewer is limited.
+    pdfOpenHTML(file, url) {
+        if (file.kind !== 'pdf') return '';
+        return `<a class="attachment-stage-btn attachment-pdf-open" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="Open PDF" aria-label="Open PDF in new tab">↗</a>`;
     },
 
     bindZoom(root, mediaSelector) {
@@ -2424,6 +2517,7 @@ const attachmentPreview = {
             ${this.mediaHTML(file, url, 'attachment-inline-media')}
             <div class="attachment-inline-overlay-actions">
                 ${this.zoomButtonsHTML(file)}
+                ${this.pdfOpenHTML(file, url)}
                 <button type="button" class="attachment-stage-btn" id="attachment-preview-close" title="Close" aria-label="Close preview">×</button>
             </div>
         </div>`;
@@ -2454,11 +2548,11 @@ const attachmentPreview = {
         this.clearInline();
         this.setInlineButton(i, false, true);
         try {
-            let bytes = await audioCacheGet(audioKey(file));
-            if (!bytes) bytes = await loadBytes(file.path);
-            const url = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+            const bytes = await loadAttachmentBytes(file);
+            const blobUrl = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+            const url = attachmentPreviewURL(file, blobUrl);
             this.path = file.path;
-            this.url = url;
+            this.url = blobUrl;
             this.file = file;
             panel.dataset.path = file.path;
             panel.hidden = false;
@@ -2477,16 +2571,17 @@ const attachmentPreview = {
         if (!canPreviewAttachment(file)) return;
         this.setFullscreenButton(i, true);
         try {
-            let bytes = await audioCacheGet(audioKey(file));
-            if (!bytes) bytes = await loadBytes(file.path);
-            const url = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+            const bytes = await loadAttachmentBytes(file);
+            const blobUrl = URL.createObjectURL(new Blob([bytes], { type: attachmentMimeType(file) }));
+            const url = attachmentPreviewURL(file, blobUrl);
             this.closeOverlay();
-            this.overlayUrl = url;
+            this.overlayUrl = blobUrl;
             const overlay = document.createElement('div');
             overlay.className = 'attachment-fs-stage';
             overlay.tabIndex = -1;
             const zoomBtns = this.zoomButtonsHTML(file);
-            overlay.innerHTML = `<div class="attachment-fs-actions">${zoomBtns}<button type="button" class="attachment-stage-btn attachment-fs-close" aria-label="Close fullscreen" title="Close (Esc)">×</button></div>${this.mediaHTML(file, url, 'attachment-fs-media')}`;
+            const openLink = this.pdfOpenHTML(file, url);
+            overlay.innerHTML = `<div class="attachment-fs-actions">${zoomBtns}${openLink}<button type="button" class="attachment-stage-btn attachment-fs-close" aria-label="Close fullscreen" title="Close (Esc)">×</button></div>${this.mediaHTML(file, url, 'attachment-fs-media')}`;
             this.overlay = overlay;
             document.body.appendChild(overlay);
             this.bindZoom(overlay, '.attachment-fs-media-image');
@@ -2806,12 +2901,17 @@ let _folderState = [];
 // Last data passed to renderView — used by applyFreshData to diff SWR refreshes.
 let _lastRenderData = null;
 
+function sameFileEntries(a, b) {
+    return JSON.stringify(a || []) === JSON.stringify(b || []);
+}
+
 function renderView(data) {
     clearPendingNavigation(CFG.path);
     attachmentPreview.clear();
     _folderState = data.folders || [];
     const files = data.files || [];
     const attachments = data.attachments || [];
+    const reusePlayer = !!(player && files.length && sameFileEntries(player.files, files));
     inspect('render', { folders: _folderState.length, files: files.length, attachments: attachments.length });
     const foldersBlock = _folderState.length && !files.length ? `
         <div class="folders-wrap">
@@ -2834,8 +2934,10 @@ function renderView(data) {
     bindDescriptionEditor();
     bindAttachmentCards(attachments);
     if (files.length) {
-        if (player) player.destroy();
-        player = new SyncPlayer(files, onPlayerChange);
+        if (!reusePlayer) {
+            if (player) player.destroy();
+            player = new SyncPlayer(files, onPlayerChange);
+        }
         _trackEls = [...document.querySelectorAll('.track')];
         _trackEls.forEach(cacheTrackElements);
         cachePlayerUI();
@@ -2843,7 +2945,9 @@ function renderView(data) {
         bindControls();
         observeWaveformLayouts();
         initStage(files);
-        player.load();
+        syncBaseToneUI();
+        if (reusePlayer) onPlayerChange(player);
+        else player.load();
     } else if (player) {
         player.destroy(); player = null;
         clearPlayerUICache();
@@ -2955,22 +3059,18 @@ function descriptionHTML() {
 function attachmentSectionHTML(files) {
     if (!files?.length) return '';
     return `<section class="attachments-wrap" aria-label="Images and PDFs">
-        <div class="attachments-list">${files.map((file, i) => `
+        <div class="attachments-list">${files.map((file, i) => {
+            return `
             <article class="attachment-chip">
-                <div class="attachment-kind-wrap ${file.kind === 'pdf' ? 'is-pdf' : 'is-image'}" aria-hidden="true">
-                    <span class="attachment-kind">${file.kind === 'pdf' ? 'PDF' : 'IMG'}</span>
-                </div>
-                <div class="attachment-name" title="${escapeHtml(file.name)}">${escapeHtml(shortAttachmentName(file.name))}</div>
-                <div class="attachment-actions">
-                    ${canPreviewAttachment(file) ? `<button type="button" class="attachment-action attachment-action-icon" data-attachment-open="${i}" title="Preview" aria-label="Preview ${escapeHtml(file.name)}">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
-                    </button>
-                    <button type="button" class="attachment-action attachment-action-icon" data-attachment-fullscreen="${i}" title="Fullscreen" aria-label="Open ${escapeHtml(file.name)} fullscreen">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true"><path d="M3 9V3h6"/><path d="M21 9V3h-6"/><path d="M3 15v6h6"/><path d="M21 15v6h-6"/></svg>
-                    </button>` : ''}
-                    <button type="button" class="attachment-action accent" data-attachment-download="${i}">Download</button>
-                </div>
-            </article>`).join('')}
+                <button type="button" class="attachment-primary" data-attachment-primary="${i}" title="Open ${escapeHtml(file.name)}" aria-label="Open ${escapeHtml(file.name)}">
+                    <div class="attachment-kind-wrap ${file.kind === 'pdf' ? 'is-pdf' : 'is-image'}" aria-hidden="true">
+                        <span class="attachment-kind">${file.kind === 'pdf' ? 'PDF' : 'IMG'}</span>
+                    </div>
+                    <div class="attachment-name" title="${escapeHtml(file.name)}">${escapeHtml(shortAttachmentName(file.name))}</div>
+                </button>
+                ${attachmentMenuHTML(file, i)}
+            </article>`;
+        }).join('')}
         </div>
         <div class="attachment-inline-preview" id="attachment-inline-preview" hidden></div>
     </section>`;
@@ -2979,10 +3079,44 @@ function attachmentSectionHTML(files) {
 function bindAttachmentCards(files) {
     if (!files?.length) return;
     files.forEach((file, i) => {
-        document.querySelector(`[data-attachment-download="${i}"]`)?.addEventListener('click', () => downloadTrackFile(file));
-        document.querySelector(`[data-attachment-open="${i}"]`)?.addEventListener('click', () => attachmentPreview.openInline(file, i));
-        document.querySelector(`[data-attachment-fullscreen="${i}"]`)?.addEventListener('click', () => attachmentPreview.openOverlay(file, i));
+        document.querySelector(`[data-attachment-primary="${i}"]`)?.addEventListener('click', () => openAttachmentNewTab(file));
+        document.querySelector(`[data-attachment-menu="${i}"]`)?.addEventListener('click', e => {
+            e.stopPropagation();
+            toggleAttachmentMenu(i);
+        });
+        document.querySelector(`[data-attachment-download="${i}"]`)?.addEventListener('click', () => {
+            closeAllAttachmentMenus();
+            downloadTrackFile(file);
+        });
+        document.querySelector(`[data-attachment-opentab="${i}"]`)?.addEventListener('click', () => {
+            closeAllAttachmentMenus();
+            openAttachmentNewTab(file);
+        });
+        document.querySelector(`[data-attachment-open="${i}"]`)?.addEventListener('click', () => {
+            closeAllAttachmentMenus();
+            attachmentPreview.openInline(file, i);
+        });
+        document.querySelector(`[data-attachment-fullscreen="${i}"]`)?.addEventListener('click', () => {
+            closeAllAttachmentMenus();
+            attachmentPreview.openOverlay(file, i);
+        });
     });
+}
+
+function closeAllAttachmentMenus() {
+    document.querySelectorAll('.attachment-menu-pop').forEach(pop => { pop.hidden = true; });
+    document.querySelectorAll('[data-attachment-menu]').forEach(btn => btn.setAttribute('aria-expanded', 'false'));
+}
+
+function toggleAttachmentMenu(i) {
+    const pop = document.getElementById(`attachment-menu-${i}`);
+    if (!pop) return;
+    const wasOpen = !pop.hidden;
+    closeAllAttachmentMenus();
+    if (!wasOpen) {
+        pop.hidden = false;
+        document.querySelector(`[data-attachment-menu="${i}"]`)?.setAttribute('aria-expanded', 'true');
+    }
 }
 
 // field-sizing:content is the modern way (Chrome 123+); JS fallback resizes
@@ -3010,7 +3144,7 @@ function trackMenuHTML(i) {
                 <span>Edit</span>
             </button>` : '';
     return `<div class="track-menu-wrap">
-        <button type="button" class="btn track-menu-btn" data-track-menu="${i}" aria-haspopup="menu" aria-expanded="false" title="More">⋮</button>
+        <button type="button" class="btn menu-trigger-btn" data-track-menu="${i}" aria-haspopup="menu" aria-expanded="false" title="More"><span class="menu-trigger-dots">⋮</span></button>
         <div class="track-menu-pop" id="tmenu-${i}" hidden role="menu">
             ${edit}<button type="button" class="tmenu-download" data-i="${i}" role="menuitem">
                 <svg viewBox="0 0 24 24"><path d="M12 3v10.59l3.29-3.3 1.42 1.42L12 16.41l-4.71-4.7 1.42-1.42L12 13.59V3h0zm-7 16h14v2H5v-2z"/></svg>
@@ -3152,6 +3286,13 @@ function onPlayerChange(p) {
 let _onPlayerChangeRetries = 0;
 
 function bindControls() {
+    // First touch/click anywhere on the page → unlock AudioContext on iOS and
+    // start decoding early so play is instant. capture:true fires before the
+    // play button's own pointerdown (which calls primePlayback as a fallback).
+    document.addEventListener('pointerdown', () => {
+        if (player) player.primeOnGesture();
+    }, { once: true, passive: true, capture: true });
+
     // Blur after click so a follow-up Space press goes through the body keydown
     // handler (single toggle) rather than re-activating the still-focused button
     // (which would double-toggle with the body handler).
