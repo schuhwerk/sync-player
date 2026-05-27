@@ -1,5 +1,5 @@
 const CACHE_PREFIX = 'syncplayer-offline';
-const CACHE_NAME = CACHE_PREFIX + '-v1779881233';
+const CACHE_NAME = CACHE_PREFIX + '-v1779882006';
 
 function shellUrl() {
     return new URL('./', self.registration.scope).toString();

@@ -618,8 +618,8 @@ class SyncPlayer {
         this.maxVolume = 1;
         this.duration = 0;
         this.isPlay = false;
-        this.lastTick = 0;
         this.currentTime = 0;
+        this._playbackBase = 0;
         // On mobile we postpone decodeAudioData until the user actually presses
         // play, but the play button still needs to enable after the bytes are
         // available. fetchedFraction tracks fetch completion; loadedFraction
@@ -641,6 +641,7 @@ class SyncPlayer {
         this._destroyed = false;
         this._gestureUnlocked = false; // AudioContext unlocked via a user gesture
         this._earlyDecodeWanted = false; // gesture fired before fetch completed
+        this._sourceRunId = 0;
     }
 
     _startTickLoop() {
@@ -714,6 +715,28 @@ class SyncPlayer {
             });
         }
         return this.ctx;
+    }
+    _syncCurrentTime() {
+        if (!this.isPlay || !this.ctx || this.ctx.state === 'closed') return this.currentTime;
+        this.currentTime = Math.max(0, Math.min(this.duration, this.ctx.currentTime - this._playbackBase));
+        return this.currentTime;
+    }
+    _invalidateSourceRun() {
+        this._sourceRunId++;
+    }
+    _handlePlaybackEnded(runId) {
+        if (!this.isPlay || runId !== this._sourceRunId) return;
+        this.currentTime = this.duration;
+        this.sources = [];
+        if (this.repeat) {
+            this.currentTime = 0;
+            this._restartSources();
+        } else {
+            this.isPlay = false;
+            this._stopTickLoop();
+            this._scheduleCtxSuspend();
+        }
+        this._emit();
     }
     _emit() {
         if (this._destroyed || this._emitRafId) return;
@@ -911,32 +934,44 @@ class SyncPlayer {
 
     _tick() {
         if (!this.isPlay) return;
-        const now = performance.now() / 1000;
-        if (this.lastTick) this.currentTime += now - this.lastTick;
-        this.lastTick = now;
+        this._syncCurrentTime();
         if (this.currentTime >= this.duration) {
-            if (this.repeat) { this.currentTime = 0; this._restartSources(); }
-            else { this.pause(); this.currentTime = this.duration; }
+            this._handlePlaybackEnded(this._sourceRunId);
+            return;
         }
         this._emit();
     }
 
     _restartSources() {
+        const ctx = this._ctx();
+        const startAt = Math.max(0, Math.min(this.duration, this.currentTime));
+        const runId = this._sourceRunId + 1;
+        this._invalidateSourceRun();
         this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
-        this.sources = this.buffers.map((buf, i) => {
-            if (!buf) return null;
+        const nextSources = this.buffers.map((buf, i) => {
+            if (!buf || startAt >= buf.duration) return null;
             let g = this.gains[i];
             if (!g) {
-                g = this.gains[i] = this._ctx().createGain();
+                g = this.gains[i] = ctx.createGain();
                 g.connect(this.limiter); // connect once — repeated connects stack and inflate gain
             }
             this._applyTrackGain(i, true);
-            const src = this._ctx().createBufferSource();
+            const src = ctx.createBufferSource();
             src.buffer = buf;
             src.connect(g);
-            src.start(0, this.currentTime);
+            src.start(0, startAt);
             return src;
         }).filter(Boolean);
+        let pending = nextSources.length;
+        nextSources.forEach(src => {
+            src.onended = () => {
+                if (runId !== this._sourceRunId) return;
+                pending = Math.max(0, pending - 1);
+                if (pending === 0) this._handlePlaybackEnded(runId);
+            };
+        });
+        this.sources = nextSources;
+        this._playbackBase = ctx.currentTime - startAt;
     }
 
     async play() {
@@ -958,7 +993,6 @@ class SyncPlayer {
             this._resumeCtx();
             this._restartSources();
             this.isPlay = true;
-            this.lastTick = performance.now() / 1000;
             this._starting = false;
             this._startTickLoop();
             this._emit();
@@ -971,12 +1005,11 @@ class SyncPlayer {
     }
     pause() {
         if (!this.isPlay) return;
-        const now = performance.now() / 1000;
-        if (this.lastTick) this.currentTime += now - this.lastTick;
+        this._syncCurrentTime();
+        this._invalidateSourceRun();
         this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
         this.sources = [];
         this.isPlay = false;
-        this.lastTick = 0;
         this._stopTickLoop();
         // Release the audio hardware so Bluetooth output reverts to other apps.
         // Browsers only drop the device when the context is suspended (or closed);
@@ -987,8 +1020,8 @@ class SyncPlayer {
     toggle() { this.isPlay ? this.pause() : this.play(); }
     seek(delta) { this.jumpTo(this.currentTime + delta); }
     jumpTo(sec) {
+        this._syncCurrentTime();
         this.currentTime = Math.max(0, Math.min(this.duration, sec));
-        this.lastTick = this.isPlay ? performance.now() / 1000 : 0;
         if (this.isPlay) this._restartSources();
         this._emit();
     }
@@ -1047,10 +1080,10 @@ class SyncPlayer {
         if (this._emitRafId) { cancelAnimationFrame(this._emitRafId); this._emitRafId = 0; }
         this._clearCtxSuspendTimer();
         this._ctxHoldCount = 0;
+        this._invalidateSourceRun();
         this.sources.forEach(s => { try { s.stop(); } catch(e) {} });
         this.sources = [];
         this.isPlay = false;
-        this.lastTick = 0;
         this.onChange = null;
         this._encoded = [];
         this.buffers = [];
