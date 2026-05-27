@@ -433,9 +433,23 @@ function clearPendingNavigation(path = null) {
 
 // Keep folder navigation in-app for both builds so cached data stays usable offline
 // and we don't depend on reloading the shell + app.js for each folder click.
+// Fire-and-forget save so unsaved edits survive navigation.
+// Called before CFG.path changes so the right path is captured.
+function flushBeforeNavigate() {
+    // bt-input commits on `change` (blur), not `input` — blur it first so the
+    // change event fires and marks dirty before we snapshot.
+    const el = document.activeElement;
+    if (el?.classList.contains('bt-input')) el.blur();
+    if (!baseToneDirty || !CFG.canWrite || baseToneSaving) return;
+    clearMetaSaveTimer();
+    baseToneDirty = false;
+    apiPost('save-meta', CFG.path, serializeMeta()).catch(() => {});
+}
+
 function navigate(newPath) {
     newPath = newPath || '/';
     if (newPath === CFG.path) return;
+    flushBeforeNavigate();
     inspect('navigate', { from: CFG.path, to: newPath });
     const params = searchParams();
     params.set('path', newPath);
@@ -1120,7 +1134,10 @@ class SyncPlayer {
             const total = this.files.length;
             if (this._deferDecode) {
                 const wfHidden = document.body.classList.contains('hide-wf');
-                let decoded = this.buffers.filter(Boolean).length;
+                // Don't update loadedFraction here — on mobile it already equals
+                // fetchedFraction (= 1), so the play button must stay enabled while
+                // decode runs. Updating it to decoded/total would grey the button and
+                // suppress the click event before play() is ever called.
                 for (let i = 0; i < total; i++) {
                     if (this._destroyed) return;
                     const bytes = this._encoded[i];
@@ -1149,7 +1166,6 @@ class SyncPlayer {
                         this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
                         inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
                     }
-                    decoded++;
                     this._emit();
                 }
             } else {
@@ -1278,16 +1294,17 @@ class SyncPlayer {
         this._starting = true;
         this._emit();
         try {
-            // First mobile play(): decode now. Resume the context first so iOS
-            // honours the user gesture — decodeAudioData itself works on a
-            // suspended context, but the subsequent start() needs the gesture
-            // chain unbroken.
+            // First mobile play(): resume context within the gesture so iOS unlocks it,
+            // then decode. After the await the gesture chain is broken, so we must also
+            // await ctx.resume() before start() — iOS silently drops source.start() on
+            // a still-suspended context.
             if (this._deferDecode) {
                 this._resumeCtx();
                 await this._decodeAll();
             }
             if (!this.buffers.some(Boolean)) return;
-            this._resumeCtx();
+            const ctx = this._resumeCtx();
+            if (ctx.state !== 'running') try { await ctx.resume(); } catch(e) {}
             this._restartSources();
             this.isPlay = true;
             this._starting = false;
@@ -1681,6 +1698,9 @@ function resetMetaState() {
     baseToneVersion = 0;
     baseToneSavedVersion = 0;
     setSaveIndicator('idle');
+    metaEditMode = false;
+    document.body.classList.remove('edit-mode');
+    $('menu-edit')?.classList.remove('on');
 }
 
 // Server-supplied optimistic-lock tokens. `false` → unknown (don't send); a
@@ -2457,6 +2477,7 @@ window.addEventListener('popstate', () => {
         attachmentPreview.closeOverlay(true);
         return;
     }
+    flushBeforeNavigate();
     initInspect();
     CFG.path = pathFromLocation();
     setHeader();
@@ -3587,6 +3608,7 @@ function onPlayerChange(p) {
         ? (Math.min(1, p.currentTime / p.duration) * 100) + '%' : '0%';
     ui.seek.classList.toggle('done', !loading);
     ui.seek.classList.toggle('is-loading', loading);
+    ui.seek.classList.toggle('preparing', starting);
     ui.play.disabled = p.loadedFraction < 1;
     ui.back5.disabled = ui.fwd5.disabled = p.loadedFraction < 1 || starting;
     ui.play.classList.toggle('is-loading', starting);

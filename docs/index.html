@@ -1,4 +1,4 @@
-<!-- Sync Player — built v1779901110 -->
+<!-- Sync Player — built v1779905401 -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -502,6 +502,11 @@ body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
             pointer-events:none;
         }
         &.done > i{opacity:0;transition:opacity .25s ease .15s}
+        /* preparing = mobile decode-on-play: brighter fill, snappier updates */
+        &.preparing > i{
+            background:color-mix(in oklab, var(--acc) 85%, transparent);
+            transition:width .1s linear;
+        }
         /* indeterminate sweep: fires when no fetch progress yet */
         & > i.indeterminate{
             width:100% !important;transition:none;
@@ -1208,9 +1213,9 @@ body.edit-mode .descr-edit:focus{
     <button class="btn" id="help-btn" title="Keyboard shortcuts (?)" onclick="toggleHelp()">
         <svg class="icon" viewBox="0 0 24 24"><path d="M11 18h2v-2h-2v2zm1-16C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm0-14c-2.21 0-4 1.79-4 4h2c0-1.1.9-2 2-2s2 .9 2 2c0 2-3 1.75-3 5h2c0-2.25 3-2.5 3-5 0-2.21-1.79-4-4-4z"/></svg>
     </button>
-    <button type="button" class="edit-chip" id="edit-chip" title="Done editing" aria-label="Done editing">
+    <button type="button" class="edit-chip" id="edit-chip" title="Save" aria-label="Save">
         <span class="edit-chip-dot" id="edit-chip-dot" aria-hidden="true"></span>
-        <span class="edit-chip-lbl">Editing</span>
+        <span class="edit-chip-lbl">Save</span>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <button class="btn" id="menu-btn" title="More" aria-haspopup="menu" aria-expanded="false" onclick="toggleMenu()">
@@ -1566,7 +1571,7 @@ window.CFG = {
     audioExt:     ["mp3","m4a","aac","wav","ogg","oga","opus","flac","webm","weba"],
     cloudUrl:     null,
     canWrite:     false,
-    buildVersion: '2026-05-27 16:58',
+    buildVersion: '2026-05-27 18:10',
     pw:           '',
     demo:         {"baseUrl":"demo/","files":[{"name":"Salmo 150 Alto.webm","lm":"Thu, 14 Nov 2019 10:26:06 GMT"},{"name":"Salmo 150 Bass.webm","lm":"Sat, 30 Sep 2017 14:11:24 GMT"},{"name":"Salmo 150 Soprano.webm","lm":"Wed, 04 Oct 2017 09:51:54 GMT"},{"name":"Salmo 150 Tenor.webm","lm":"Sun, 15 Oct 2017 23:28:10 GMT"}],"attachments":[],"readme":"Recording from Libby Montiel Gopal - check their YouTube: https://www.youtube.com/@LibbyMontielGopal\n"}
 };
@@ -2007,9 +2012,23 @@ function clearPendingNavigation(path = null) {
 
 // Keep folder navigation in-app for both builds so cached data stays usable offline
 // and we don't depend on reloading the shell + app.js for each folder click.
+// Fire-and-forget save so unsaved edits survive navigation.
+// Called before CFG.path changes so the right path is captured.
+function flushBeforeNavigate() {
+    // bt-input commits on `change` (blur), not `input` — blur it first so the
+    // change event fires and marks dirty before we snapshot.
+    const el = document.activeElement;
+    if (el?.classList.contains('bt-input')) el.blur();
+    if (!baseToneDirty || !CFG.canWrite || baseToneSaving) return;
+    clearMetaSaveTimer();
+    baseToneDirty = false;
+    apiPost('save-meta', CFG.path, serializeMeta()).catch(() => {});
+}
+
 function navigate(newPath) {
     newPath = newPath || '/';
     if (newPath === CFG.path) return;
+    flushBeforeNavigate();
     inspect('navigate', { from: CFG.path, to: newPath });
     const params = searchParams();
     params.set('path', newPath);
@@ -2694,7 +2713,10 @@ class SyncPlayer {
             const total = this.files.length;
             if (this._deferDecode) {
                 const wfHidden = document.body.classList.contains('hide-wf');
-                let decoded = this.buffers.filter(Boolean).length;
+                // Don't update loadedFraction here — on mobile it already equals
+                // fetchedFraction (= 1), so the play button must stay enabled while
+                // decode runs. Updating it to decoded/total would grey the button and
+                // suppress the click event before play() is ever called.
                 for (let i = 0; i < total; i++) {
                     if (this._destroyed) return;
                     const bytes = this._encoded[i];
@@ -2723,7 +2745,6 @@ class SyncPlayer {
                         this.loadError = this.loadError || 'Audio could not be decoded — file may be corrupt.';
                         inspect('audio:decode-error', { path: this.files[i].path, message: e?.message || String(e) });
                     }
-                    decoded++;
                     this._emit();
                 }
             } else {
@@ -2852,16 +2873,17 @@ class SyncPlayer {
         this._starting = true;
         this._emit();
         try {
-            // First mobile play(): decode now. Resume the context first so iOS
-            // honours the user gesture — decodeAudioData itself works on a
-            // suspended context, but the subsequent start() needs the gesture
-            // chain unbroken.
+            // First mobile play(): resume context within the gesture so iOS unlocks it,
+            // then decode. After the await the gesture chain is broken, so we must also
+            // await ctx.resume() before start() — iOS silently drops source.start() on
+            // a still-suspended context.
             if (this._deferDecode) {
                 this._resumeCtx();
                 await this._decodeAll();
             }
             if (!this.buffers.some(Boolean)) return;
-            this._resumeCtx();
+            const ctx = this._resumeCtx();
+            if (ctx.state !== 'running') try { await ctx.resume(); } catch(e) {}
             this._restartSources();
             this.isPlay = true;
             this._starting = false;
@@ -3255,6 +3277,9 @@ function resetMetaState() {
     baseToneVersion = 0;
     baseToneSavedVersion = 0;
     setSaveIndicator('idle');
+    metaEditMode = false;
+    document.body.classList.remove('edit-mode');
+    $('menu-edit')?.classList.remove('on');
 }
 
 // Server-supplied optimistic-lock tokens. `false` → unknown (don't send); a
@@ -4031,6 +4056,7 @@ window.addEventListener('popstate', () => {
         attachmentPreview.closeOverlay(true);
         return;
     }
+    flushBeforeNavigate();
     initInspect();
     CFG.path = pathFromLocation();
     setHeader();
@@ -5161,6 +5187,7 @@ function onPlayerChange(p) {
         ? (Math.min(1, p.currentTime / p.duration) * 100) + '%' : '0%';
     ui.seek.classList.toggle('done', !loading);
     ui.seek.classList.toggle('is-loading', loading);
+    ui.seek.classList.toggle('preparing', starting);
     ui.play.disabled = p.loadedFraction < 1;
     ui.back5.disabled = ui.fwd5.disabled = p.loadedFraction < 1 || starting;
     ui.play.classList.toggle('is-loading', starting);

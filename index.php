@@ -864,9 +864,9 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
     <button class="btn" id="help-btn" title="Keyboard shortcuts (?)" onclick="toggleHelp()">
         <svg class="icon" viewBox="0 0 24 24"><path d="M11 18h2v-2h-2v2zm1-16C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm0-14c-2.21 0-4 1.79-4 4h2c0-1.1.9-2 2-2s2 .9 2 2c0 2-3 1.75-3 5h2c0-2.25 3-2.5 3-5 0-2.21-1.79-4-4-4z"/></svg>
     </button>
-    <button type="button" class="edit-chip" id="edit-chip" title="Done editing" aria-label="Done editing">
+    <button type="button" class="edit-chip" id="edit-chip" title="Save" aria-label="Save">
         <span class="edit-chip-dot" id="edit-chip-dot" aria-hidden="true"></span>
-        <span class="edit-chip-lbl">Editing</span>
+        <span class="edit-chip-lbl">Save</span>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <button class="btn" id="menu-btn" title="More" aria-haspopup="menu" aria-expanded="false" onclick="toggleMenu()">

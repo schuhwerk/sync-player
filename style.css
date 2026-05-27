@@ -483,6 +483,11 @@ body.edit-mode .bt-wrap.can-edit .bt-badge{display:none}
             pointer-events:none;
         }
         &.done > i{opacity:0;transition:opacity .25s ease .15s}
+        /* preparing = mobile decode-on-play: brighter fill, snappier updates */
+        &.preparing > i{
+            background:color-mix(in oklab, var(--acc) 85%, transparent);
+            transition:width .1s linear;
+        }
         /* indeterminate sweep: fires when no fetch progress yet */
         & > i.indeterminate{
             width:100% !important;transition:none;
