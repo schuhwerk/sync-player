@@ -842,6 +842,7 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
 <meta name="theme-color" content="<?php echo htmlspecialchars($PWA_THEME_COLOR_LIGHT, ENT_QUOTES); ?>" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="<?php echo htmlspecialchars($PWA_THEME_COLOR_DARK, ENT_QUOTES); ?>" media="(prefers-color-scheme: dark)">
 <meta id="meta-theme-color" name="theme-color" content="<?php echo htmlspecialchars($PWA_THEME_COLOR_DARK, ENT_QUOTES); ?>">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="<?php echo htmlspecialchars($TITLE); ?>">
@@ -924,18 +925,20 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
         <button type="button" data-theme="light" role="radio">Light</button>
         <button type="button" data-theme="dark"  role="radio">Dark</button>
     </div>
+    <p class="info" id="menu-version"></p>
 </div>
 <div id="status-banner" class="status-banner" data-level="info" hidden role="status" aria-live="polite"></div>
 <div id="inspect-log" class="inspect-log" hidden aria-hidden="true"></div>
 <div id="root"><div class="loading">Loading…</div></div>
 
 <script>window.CFG = {
-    adapterId: <?php echo json_encode($adapter->id()); ?>,
-    title:     <?php echo json_encode($TITLE); ?>,
-    path:      <?php echo json_encode($path); ?>,
-    audioExt:  <?php echo json_encode($audio_ext); ?>,
-    cloudUrl:  <?php echo json_encode($adapter->cloudUrl($path)); ?>,
-    canWrite:  <?php echo json_encode($adapter->canWrite()); ?>,
+    adapterId:    <?php echo json_encode($adapter->id()); ?>,
+    title:        <?php echo json_encode($TITLE); ?>,
+    path:         <?php echo json_encode($path); ?>,
+    audioExt:     <?php echo json_encode($audio_ext); ?>,
+    cloudUrl:     <?php echo json_encode($adapter->cloudUrl($path)); ?>,
+    canWrite:     <?php echo json_encode($adapter->canWrite()); ?>,
+    buildVersion: <?php echo json_encode(date('Y-m-d H:i', filemtime(__DIR__.'/app.js'))); ?>,
     pw: ""
 };</script>
 <script src="app.js?v=<?php echo file_exists(__DIR__."/app.js") ? filemtime(__DIR__."/app.js") : 0; ?>"></script>

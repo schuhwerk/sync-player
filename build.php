@@ -90,6 +90,7 @@ $version = max(
     filemtime("$root/style.css"),
     filemtime("$root/adapters/browser-fs.js"),
 );
+$buildDate = date('Y-m-d H:i', $version);
 
 $docsTitle = 'Sync Player';
 $pwaThemeColorLight = '#f3ecdc';
@@ -129,6 +130,7 @@ $out = <<<HTML
 <meta name="theme-color" content="$pwaThemeColorLight" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="$pwaThemeColorDark" media="(prefers-color-scheme: dark)">
 <meta id="meta-theme-color" name="theme-color" content="$pwaThemeColorDark">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="$docsTitle">
@@ -144,13 +146,14 @@ $browserFsJs
 </script>
 <script>
 window.CFG = {
-    adapterId: 'browser-fs',
-    path:      new URLSearchParams(location.search).get('path') || '/',
-    audioExt:  $audioExtJson,
-    cloudUrl:  null,
-    canWrite:  false,
-    pw:        '',
-    demo:      $demoCfg
+    adapterId:    'browser-fs',
+    path:         new URLSearchParams(location.search).get('path') || '/',
+    audioExt:     $audioExtJson,
+    cloudUrl:     null,
+    canWrite:     false,
+    buildVersion: '$buildDate',
+    pw:           '',
+    demo:         $demoCfg
 };
 </script>
 <script>

@@ -3803,4 +3803,5 @@ initShowWaveforms();
 initStageEnabled();
 initInspect();
 bindMenu();
+if (CFG.buildVersion) { const el = $('menu-version'); if (el) el.textContent = 'v' + CFG.buildVersion; }
 init();
