@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "description": "Test-only deps for sync-player. Not used by the runtime — the runtime is pure PHP + ES modules. Install: `npm install --prefix test`.",
+  "type": "module",
+  "devDependencies": {
+    "playwright": "1.60.0"
+  }
+}

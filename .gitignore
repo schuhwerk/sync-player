@@ -4,3 +4,7 @@ config.php
 !.vscode/tasks.json
 # docs/ is tracked — it's the GitHub Pages artifact (index.html + demo/ songs).
 # `php build.php` rewrites docs/index.html, so expect that file to churn during dev.
+
+# Test-only deps (Playwright). Installed by `test/run.sh` on first run.
+test/node_modules
+test/package-lock.json

@@ -20,13 +20,59 @@
             }
         },
         {
+            "label": "watch: bun build app.js",
+            "detail": "Rebuilds app.js (~10ms) on every src/*.js save. No php build.php needed for JS-only dev.",
+            "type": "shell",
+            "command": "bun",
+            "args": [
+                "build", "src/main.js",
+                "--bundle", "--format=esm", "--target=browser",
+                "--outfile=app.js", "--watch"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "isBackground": true,
+            "runOptions": { "runOn": "folderOpen" },
+            "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+            "problemMatcher": {
+                "owner": "bun",
+                "fileLocation": ["relative", "${workspaceFolder}"],
+                "pattern": {
+                    "regexp": "^(error|warning): (.*)\\s+at (.*):(\\d+):(\\d+)$",
+                    "severity": 1, "message": 2, "file": 3, "line": 4, "column": 5
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": ".*",
+                    "endsPattern": "Bundled .* in .*ms"
+                }
+            }
+        },
+        {
+            "label": "dev: serve + watch",
+            "detail": "php -S localhost:8000 + bun build --watch. Open /?path=/ — saves rebuild app.js in ~10ms.",
+            "dependsOn": ["serve: php -S localhost:8000", "watch: bun build app.js"],
+            "dependsOrder": "parallel",
+            "problemMatcher": []
+        },
+        {
             "label": "build: docs/index.html",
+            "detail": "Full build via php build.php (shells out to bun, then inlines into docs/).",
             "type": "shell",
             "command": "php",
             "args": ["build.php"],
             "options": { "cwd": "${workspaceFolder}" },
             "presentation": { "reveal": "always", "panel": "shared", "clear": true },
             "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": []
+        },
+        {
+            "label": "test: bun test",
+            "type": "shell",
+            "command": "bun",
+            "args": ["test"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+            "group": { "kind": "test", "isDefault": true },
             "problemMatcher": []
         },
         {

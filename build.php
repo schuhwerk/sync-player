@@ -18,10 +18,26 @@ function read_or_die(string $path): string {
 }
 
 $indexSrc    = read_or_die("$root/index.php");
-$appJs       = read_or_die("$root/app.js");
 $browserFsJs = read_or_die("$root/adapters/browser-fs.js");
 $swJs        = read_or_die("$root/sw.js");
 $cssContent  = read_or_die("$root/style.css");
+
+// Bundle src/main.js → app.js via bun. Prefer `bun` on PATH; fall back to the
+// known absolute path in case the exec environment has a minimal PATH.
+$bunCmd = trim((string)shell_exec('command -v bun 2>/dev/null'));
+if (!$bunCmd) $bunCmd = '/home/vs/.bun/bin/bun';
+$entry  = escapeshellarg("$root/src/main.js");
+$outfile = escapeshellarg("$root/app.js");
+$cmd = "$bunCmd build $entry --bundle --format=esm --target=browser --outfile=$outfile 2>&1";
+exec($cmd, $bunOut, $bunExit);
+if ($bunExit !== 0) {
+    fwrite(STDERR, "bun build failed (exit $bunExit):\n" . implode("\n", $bunOut) . "\n");
+    exit(1);
+}
+$appJs = read_or_die("$root/app.js");
+
+// Version basis: max mtime of src/*.js so unchanged rebuilds don't trigger SW re-installs.
+$srcFiles = glob("$root/src/*.js") ?: [];
 
 // html-shell: from <!-- ## html-shell --> to </body> (no closing marker needed).
 if (!preg_match('/<!-- ## html-shell -->(.*?)<\/body>/s', $indexSrc, $m)) {
@@ -85,11 +101,12 @@ if (is_dir($demoDir)) {
 
 // Version = max mtime of inlined sources — same sources → same version,
 // so unchanged rebuilds don't trigger spurious SW re-installs.
-$version = max(
-    filemtime("$root/app.js"),
+$srcMtimes = array_map('filemtime', $srcFiles);
+$allMtimes = array_merge($srcMtimes, [
     filemtime("$root/style.css"),
     filemtime("$root/adapters/browser-fs.js"),
-);
+]);
+$version = max($allMtimes);
 $buildDate = date('Y-m-d H:i', $version);
 
 $docsTitle = 'Sync Player';
@@ -156,7 +173,10 @@ window.CFG = {
     demo:         $demoCfg
 };
 </script>
-<script>
+<script type="module">
+// type="module" is required: the bun bundle is ESM-format and uses
+// import.meta, which throws in a classic script. Inline modules are deferred,
+// so the classic CFG + adapter scripts above always run first.
 $appJs
 </script>
 </body>

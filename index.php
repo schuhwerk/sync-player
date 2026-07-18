@@ -23,8 +23,11 @@ $cfg = [
     'nextcloud' => ['host' => '', 'token' => '', 'password' => '', 'password_hint' => '', 'can_write' => false],
     'local'     => ['root' => __DIR__ . '/public'],
 ];
-if (is_file(__DIR__ . '/config.php')) {
-    $cfg = array_replace_recursive($cfg, require __DIR__ . '/config.php');
+// SYNCPLAYER_CONFIG relocates the config file (Docker/YunoHost mounts, tests).
+// Point it at a non-file (e.g. /dev/null) to force pure defaults + env.
+$configFile = getenv('SYNCPLAYER_CONFIG') ?: __DIR__ . '/config.php';
+if (is_file($configFile)) {
+    $cfg = array_replace_recursive($cfg, require $configFile);
 }
 // env overrides: [env var => path into $cfg]. Strings only; bools handled below.
 foreach ([
@@ -36,6 +39,7 @@ foreach ([
     'SYNCPLAYER_NC_TOKEN'          => ['nextcloud', 'token'],
     'SYNCPLAYER_NC_PASSWORD'       => ['nextcloud', 'password'],
     'SYNCPLAYER_NC_PASSWORD_HINT'  => ['nextcloud', 'password_hint'],
+    'SYNCPLAYER_LOCAL_ROOT'        => ['local', 'root'],
 ] as $env => $keys) {
     $v = getenv($env);
     if ($v === false || $v === '') continue;
@@ -65,7 +69,13 @@ header("Content-Security-Policy: frame-ancestors 'self'");
 header('X-Robots-Tag: noindex, nofollow');
 
 $path = $_GET['path'] ?? '/';
-foreach (explode('/', $path) as $seg) if ($seg === '..') { http_response_code(400); exit('Invalid path'); }
+if (!is_string($path) || str_contains($path, "\0")) { http_response_code(400); exit('Invalid path'); }
+// Reject '..' (traversal) and any dot-leading segment: listings never expose
+// hidden entries, so no legitimate path contains one — this keeps ?mode=fetch
+// from serving e.g. /.git/config or /.env under a carelessly chosen root.
+foreach (explode('/', $path) as $seg) {
+    if ($seg === '..' || ($seg !== '' && $seg[0] === '.')) { http_response_code(400); exit('Invalid path'); }
+}
 
 $password = (string)($_GET['password'] ?? $_POST['password'] ?? '');
 if (strlen($password) > 256) { http_response_code(400); exit('Invalid password'); }
@@ -592,9 +602,14 @@ class LocalAdapter extends Adapter {
         if ($download) attachmentHeader(basename($abs));
 
         $start = 0; $end = $size - 1;
-        if (!empty($_SERVER['HTTP_RANGE']) && preg_match('/bytes=(\d*)-(\d*)/', $_SERVER['HTTP_RANGE'], $m)) {
-            if ($m[1] !== '') $start = (int)$m[1];
-            if ($m[2] !== '') $end = (int)$m[2];
+        if (!empty($_SERVER['HTTP_RANGE']) && preg_match('/bytes=(\d*)-(\d*)/', $_SERVER['HTTP_RANGE'], $m)
+            && ($m[1] !== '' || $m[2] !== '')) {
+            if ($m[1] === '') { // suffix form "-N": last N bytes ("-0" is unsatisfiable)
+                $start = (int)$m[2] === 0 ? $size : max(0, $size - (int)$m[2]);
+            } else {
+                $start = (int)$m[1];
+                if ($m[2] !== '') $end = (int)$m[2];
+            }
             if ($start > $end || $end >= $size) {
                 http_response_code(416);
                 header("Content-Range: bytes */$size");
@@ -753,6 +768,13 @@ if (($_GET['mode'] ?? '') === 'search') {
 // ?mode=fetch&path=...[&download=1] — stream a file with Range + cache headers.
 // download=1 adds Content-Disposition: attachment so the browser saves it.
 if (($_GET['mode'] ?? '') === 'fetch') {
+    // Only serve what list() exposes (audio + attachments) — keeps stray files
+    // under the root (configs, backups, notes) unreachable even when guessed.
+    $name = basename($path);
+    if (!preg_match(audioRegex($audio_ext), $name) && !attachmentKind($name)) {
+        http_response_code(404);
+        exit;
+    }
     $download = !empty($_GET['download']);
     $adapter->fetch($path, $password, $download);
     exit;
@@ -938,9 +960,15 @@ $title = basename(rtrim($path, '/')) ?: $TITLE;
     audioExt:     <?php echo json_encode($audio_ext); ?>,
     cloudUrl:     <?php echo json_encode($adapter->cloudUrl($path)); ?>,
     canWrite:     <?php echo json_encode($adapter->canWrite()); ?>,
-    buildVersion: <?php echo json_encode(date('Y-m-d H:i', filemtime(__DIR__.'/app.js'))); ?>,
+    buildVersion: <?php
+    $srcMtimes = array_map('filemtime', glob(__DIR__.'/src/*.js') ?: []);
+    echo json_encode(date('Y-m-d H:i', $srcMtimes ? max($srcMtimes) : filemtime(__FILE__)));
+    ?>,
     pw: ""
 };</script>
-<script src="app.js?v=<?php echo file_exists(__DIR__."/app.js") ? filemtime(__DIR__."/app.js") : 0; ?>"></script>
+<?php
+$basePath = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? '/'), '/').'/';
+?>
+<script type="module" src="<?php echo htmlspecialchars($basePath, ENT_QUOTES); ?>app.js?v=<?php echo filemtime(__DIR__.'/app.js'); ?>"></script>
 </body>
 </html>
